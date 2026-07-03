@@ -62,7 +62,7 @@ whatever machine runs the bridge, both one-time interactive approvals:
 | `SPECTRUM_TARGET_HANDLE` | no | Override the default outbound target (otherwise the first handle in `SPECTRUM_CAPTAIN_HANDLE`). Either handle works as a target; this just picks which one `fm-spectrum-notify.sh` defaults to when no `--target` is given. |
 | `SPECTRUM_DRY_RUN` | no | Truthy (anything but unset/empty/`0`/`false`/`no`/`off`) puts outbound sends in preview mode: nothing is sent, the would-send payload is recorded to `state/spectrum-outbox/`, and a `DRY RUN` summary prints to stderr. Mirrors `FMX_DRY_RUN`. |
 | `SPECTRUM_ENV_FILE` | no | Point a direct client invocation at a different `.env`-style file (testing only; normal use reads `$FM_HOME/.env`). |
-| `SPECTRUM_BRIDGE_STALE_SECS` | no | Seconds before `fm-spectrum-status.sh` calls the bridge's liveness beacon stale. Default `90` (the bridge touches its beacon roughly every 20s, so this gives several missed cycles of grace). |
+| `SPECTRUM_BRIDGE_STALE_SECS` | no | Seconds before `fm-spectrum-status.sh` calls the bridge's liveness beacon stale. Default `90` (the bridge touches its beacon roughly every 15s, so this gives several missed cycles of grace). |
 
 No Photon `projectId`/`projectSecret` is ever required - local mode has an
 explicit no-credentials construction path (see the design report, section 1).
