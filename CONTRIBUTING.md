@@ -77,6 +77,7 @@ tests/fm-session-start.test.sh            # fm-session-start.sh: ABSENT vs empty
 tests/fm-grok-harness.test.sh             # grok adapter spawn hook, token guard, teardown cleanup, and session-lock detection tests
 tests/fm-fleet-sync.test.sh               # project clone refresh: safe detached recovery, STUCK drift reports, benign skips, and bootstrap relay
 tests/fm-x-mode.test.sh                   # X-mode poll, inbox context round-trip, reply threading, dismiss, dry-run preview, and .env-presence activation tests
+tests/fm-spectrum-mode.test.sh            # fm-spectrum (private captain<->firstmate iMessage channel, slice 1): shared lib config resolution, notify outbox drop and target defaulting, status beacon states, .env-presence inertness, dry-run preview, and bridge launcher dependency-missing failure
 tests/fm-tangle-guard.test.sh             # primary-checkout tangle detection, read-only remediation suppression, and spawn/brief isolation tests
 tests/fm-spawn-batch.test.sh              # batch dispatch and FM_HOME project-path scoping tests
 tests/fm-spawn-dispatch-profile.test.sh   # concrete dispatch profile flags: active-profile backstop, harness/model/effort meta, launch templates, batch forwarding, and secondmate exemption
