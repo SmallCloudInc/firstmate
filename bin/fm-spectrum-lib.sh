@@ -17,6 +17,13 @@
 #                                     handle in SPECTRUM_CAPTAIN_HANDLE)
 #   spectrum_outbox_write <target> <text> <dry_run> - atomically drop one
 #                                     outbound message for the bridge to pick up
+#   spectrum_beacon_state <beacon-file> <stale-secs> - print healthy|stale|dead
+#                                     for a liveness beacon (shared by
+#                                     fm-spectrum-status.sh and
+#                                     fm-spectrum-ensure-bridge.sh)
+#   spectrum_inbox_list <inbox-dir>  - print the pending inbox JSON files in a
+#                                     deterministic (sorted) order, one per
+#                                     line, skipping dotfiles/tmp remnants
 # Callers must have FM_HOME set before calling spectrum_load_config.
 #
 # SPECTRUM_CAPTAIN_HANDLE may name more than one handle for the same captain
@@ -138,4 +145,38 @@ spectrum_outbox_write() {
     return 1
   fi
   printf '%s\n' "$id"
+}
+
+# spectrum_beacon_state <beacon-file> <stale-secs>: print one of dead|stale|healthy
+# and return 0 for healthy, 1 otherwise - mirrors the exit-code contract
+# fm-spectrum-status.sh has always used, so callers keep scripting off it
+# directly. <stale-secs> falls back to 90 when empty/non-numeric.
+spectrum_beacon_state() {
+  local beacon=$1 stale_secs=$2 now mtime age
+  case "$stale_secs" in ''|*[!0-9]*) stale_secs=90 ;; esac
+  if [ ! -f "$beacon" ]; then
+    printf 'dead\n'
+    return 1
+  fi
+  now=$(date +%s 2>/dev/null) || now=0
+  mtime=$(stat -f '%m' "$beacon" 2>/dev/null || stat -c '%Y' "$beacon" 2>/dev/null) || mtime=0
+  case "$mtime" in ''|*[!0-9]*) mtime=0 ;; esac
+  age=$((now - mtime))
+  [ "$age" -ge 0 ] || age=0
+  if [ "$age" -gt "$stale_secs" ]; then
+    printf 'stale\n'
+    return 1
+  fi
+  printf 'healthy\n'
+  return 0
+}
+
+# spectrum_inbox_list <inbox-dir>: print the pending *.json inbox files (full
+# paths), one per line, sorted for determinism, skipping dotfiles and any
+# *.json.tmp remnant from an interrupted atomic write. Prints nothing (and
+# succeeds) when the directory is absent or empty.
+spectrum_inbox_list() {
+  local dir=$1
+  [ -d "$dir" ] || return 0
+  find "$dir" -maxdepth 1 -type f -name '*.json' ! -name '.*' -print 2>/dev/null | sort
 }

@@ -19,8 +19,10 @@
 #
 # Deliberately does NOT touch bin/fm-watch.sh, fm-watch-arm.sh, fm-wake-lib.sh,
 # or the afk daemon - this is a standalone health check a caller polls by hand
-# or from a task's own state/<id>.check.sh, not a watcher wake source (that
-# wiring is the next slice).
+# or from a task's own state/<id>.check.sh. Slice 2 wires bridge supervision
+# into the watcher through a separate check shim (bin/fm-spectrum-poll.sh /
+# state/spectrum-watch.check.sh), which shares this script's beacon-state logic
+# via spectrum_beacon_state() in fm-spectrum-lib.sh rather than duplicating it.
 #
 # Stale threshold: SPECTRUM_BRIDGE_STALE_SECS (default 90; the bridge is
 # expected to touch its beacon roughly every 20s, so this gives several missed
@@ -54,21 +56,22 @@ STALE_SECS=${SPECTRUM_BRIDGE_STALE_SECS:-90}
 case "$STALE_SECS" in ''|*[!0-9]*) STALE_SECS=90 ;; esac
 
 BEACON="$STATE/.spectrum-bridge-beat"
-if [ ! -f "$BEACON" ]; then
-  echo "spectrum: dead (no beacon found at state/.spectrum-bridge-beat - bridge never started or was torn down)"
-  exit 1
-fi
-
 NOW=$(date +%s 2>/dev/null) || NOW=0
 BEACON_MTIME=$(stat -f '%m' "$BEACON" 2>/dev/null || stat -c '%Y' "$BEACON" 2>/dev/null) || BEACON_MTIME=0
 case "$BEACON_MTIME" in ''|*[!0-9]*) BEACON_MTIME=0 ;; esac
-
 AGE=$((NOW - BEACON_MTIME))
 [ "$AGE" -ge 0 ] || AGE=0
 
-if [ "$AGE" -gt "$STALE_SECS" ]; then
-  printf 'spectrum: stale (beacon %ss ago, expected under %ss - bridge may be hung or crashed)\n' "$AGE" "$STALE_SECS"
-  exit 1
-fi
-
-printf 'spectrum: healthy (beacon %ss ago)\n' "$AGE"
+case "$(spectrum_beacon_state "$BEACON" "$STALE_SECS")" in
+  dead)
+    echo "spectrum: dead (no beacon found at state/.spectrum-bridge-beat - bridge never started or was torn down)"
+    exit 1
+    ;;
+  stale)
+    printf 'spectrum: stale (beacon %ss ago, expected under %ss - bridge may be hung or crashed)\n' "$AGE" "$STALE_SECS"
+    exit 1
+    ;;
+  *)
+    printf 'spectrum: healthy (beacon %ss ago)\n' "$AGE"
+    ;;
+esac

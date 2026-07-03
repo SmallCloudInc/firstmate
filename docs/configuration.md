@@ -176,7 +176,8 @@ Spectrum is an opt-in private two-way iMessage channel between the captain and f
 It is off unless the firstmate home's gitignored `.env` sets a non-empty `SPECTRUM_SELF_HANDLE`; absent it, every `fm-spectrum-*` script is a hard no-op (exit 0).
 `SPECTRUM_CAPTAIN_HANDLE` is a comma-separated allowlist of the captain's handles: any of them is honored on inbound, and the first is the default outbound target unless `SPECTRUM_TARGET_HANDLE` overrides it.
 `SPECTRUM_DRY_RUN` previews outbound sends (recorded to `state/spectrum-outbox/`) without a live Messages account or bridge process, and `SPECTRUM_ENV_FILE` points direct client invocations at an alternate `.env`-style file for testing.
-Slice 1 ships the bridge, outbound escalations, dry-run, and health checking; inbound wake-queue wiring and a respond skill are deferred.
+Slice 1 shipped the bridge, outbound escalations, dry-run, and health checking.
+Slice 2 makes the channel always-on and two-way: bootstrap wires inbound messages into the existing watcher check mechanism (`state/spectrum-watch.check.sh`, `config/spectrum-mode.env` at a 20s cadence), the agent-only `spectrum-respond` skill drains and acts on them, `fm-spectrum-ensure-bridge.sh` keeps the bridge process itself always running (idempotent start/restart, single-instance locked), and `fm-spectrum-escalate.sh` auto-pushes captain-facing escalations to the channel when the captain is away (`state/.afk`).
 Full detail lives in [docs/spectrum-backend.md](spectrum-backend.md).
 
 ## Environment variables

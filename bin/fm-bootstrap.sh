@@ -11,7 +11,10 @@
 #                 "TASKS_AXI: available", "TANGLE: <remediation>",
 #                 "SECONDMATE_SYNC: secondmate <id>: skipped: <reason>",
 #                 "NUDGE_SECONDMATES: <window-targets...>",
-#                 "FMX: X mode on ..." or "FMX: X mode off ...".
+#                 "FMX: X mode on ..." or "FMX: X mode off ...",
+#                 "SPECTRUM: channel on ..." or "SPECTRUM: channel off ...",
+#                 "SPECTRUM: <bridge supervision line>" or
+#                 "SPECTRUM: bridge supervision failed - <detail>".
 #          A NUDGE_SECONDMATES line lists the RUNNING secondmate windows whose
 #          worktree was fast-forwarded to firstmate's own current default-branch
 #          commit (a purely LOCAL fast-forward, never an origin fetch) AND whose
@@ -37,19 +40,27 @@
 #          X mode is OPTIONAL and inert unless FM_HOME/.env has a non-empty
 #          FMX_PAIRING_TOKEN. When opted in, bootstrap requires curl+jq, writes
 #          the relay poll shim and 30s cadence config, and prints an FMX line.
+#          fm-spectrum (the private captain<->firstmate iMessage channel) is
+#          OPTIONAL and inert unless FM_HOME/.env has a non-empty
+#          SPECTRUM_SELF_HANDLE. When opted in, bootstrap writes the inbound
+#          poll shim and 20s cadence config (SPECTRUM line), then ensures the
+#          bridge process itself is running (starting or restarting it as
+#          needed) via bin/fm-spectrum-ensure-bridge.sh - see
+#          docs/spectrum-backend.md.
 #          Fleet sync fetches, fast-forwards safe default-branch states, reports
 #          recovered and STUCK clone drift, and prunes gone local branches; it is
 #          bounded by FM_FLEET_SYNC_BOOTSTRAP_TIMEOUT, default 20s.
 #          Set FM_FLEET_PRUNE=0 to skip branch pruning during that refresh.
-#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the three MUTATING sweeps
-#          (secondmate_sync, x_mode_setup, fleet_sync) while still printing
+#          Set FM_BOOTSTRAP_DETECT_ONLY=1 to skip the MUTATING sweeps
+#          (secondmate_sync, x_mode_setup, spectrum_watch_setup,
+#          spectrum_bridge_supervise, fleet_sync) while still printing
 #          every read-only detect line above; the TANGLE line switches to
 #          advisory-only wording with no checkout command. Used by
 #          fm-session-start.sh's read-only path when another live session holds
 #          the fleet lock, so a second concurrent session never race-mutates
-#          secondmate homes, X-mode artifacts, project clones, or repair
-#          instructions. Unset/0 (the default) runs every sweep exactly as
-#          before - this flag is purely additive.
+#          secondmate homes, X-mode/spectrum artifacts, project clones, or
+#          repair instructions. Unset/0 (the default) runs every sweep exactly
+#          as before - this flag is purely additive.
 #        fm-bootstrap.sh install <tool>...
 #          Install the named tools (only ones the captain approved).
 set -u
@@ -70,6 +81,8 @@ STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
 . "$SCRIPT_DIR/fm-config-inherit-lib.sh"
 # shellcheck source=bin/fm-x-lib.sh
 . "$SCRIPT_DIR/fm-x-lib.sh"
+# shellcheck source=bin/fm-spectrum-lib.sh
+. "$SCRIPT_DIR/fm-spectrum-lib.sh"
 
 fleet_sync() {
   [ -x "$FM_ROOT/bin/fm-fleet-sync.sh" ] || return 0
@@ -311,6 +324,117 @@ EOF
   echo "FMX: X mode on - relay poll armed via state/x-watch.check.sh; 30s watcher cadence in config/x-mode.env"
 }
 
+# fm-spectrum slice 2: when this home's .env carries a non-empty
+# SPECTRUM_SELF_HANDLE, wire the private captain<->firstmate iMessage channel's
+# inbound loop and bridge supervision into the EXISTING watcher check
+# mechanism, exactly the way x_mode_setup wires X mode - without touching
+# fm-watch.sh, fm-watch-arm.sh, fm-wake-lib.sh, or the afk daemon. Drops two
+# idempotent, gitignored artifacts:
+#   state/spectrum-watch.check.sh - check shim that execs bin/fm-spectrum-poll.sh
+#                                    each cycle (supervises the bridge AND
+#                                    surfaces pending inbound as a wake)
+#   config/spectrum-mode.env      - exports FM_CHECK_INTERVAL=20, sourced by the
+#                                    watcher arm so a spectrum instance polls at
+#                                    a tight local cadence (no network round
+#                                    trip is involved - the bridge already wrote
+#                                    the inbound file straight to disk - so a
+#                                    short interval is cheap; see
+#                                    docs/spectrum-backend.md for how to combine
+#                                    this with X mode's own cadence file when
+#                                    both are enabled on the same home)
+# On opt-out (no handle, or empty) it removes any such artifacts so the
+# instance reverts to the default 300s no-poll behavior. Absent a handle AND
+# with no leftover artifacts it is a complete no-op (nothing written, nothing
+# printed), so a non-spectrum user sees zero change. Prints one confirmation
+# line on opt-in, and one on opt-out only when it actually removed artifacts.
+spectrum_watch_setup() {
+  local env_file handle shim cadence shim_body cadence_body
+  env_file="$FM_HOME/.env"
+  shim="$STATE/spectrum-watch.check.sh"
+  cadence="$CONFIG/spectrum-mode.env"
+
+  handle=
+  [ -f "$env_file" ] && handle=$(spectrum_env_get SPECTRUM_SELF_HANDLE "$env_file")
+
+  spectrum_watch_remove_artifacts() {
+    rm -f "$shim" "$cadence" 2>/dev/null || true
+    [ ! -e "$shim" ] && [ ! -e "$cadence" ]
+  }
+
+  if [ -z "$handle" ]; then
+    if [ -e "$shim" ] || [ -e "$cadence" ]; then
+      if spectrum_watch_remove_artifacts; then
+        echo "SPECTRUM: channel off - removed inbound/bridge-supervision poll shim and 20s cadence; restart the watcher (bin/fm-watch-arm.sh --restart) to drop back to the default cadence"
+      else
+        echo "SPECTRUM: channel off - failed to remove poll shim or 20s cadence"
+      fi
+    fi
+    return 0
+  fi
+
+  spectrum_watch_arm_failed() {
+    if spectrum_watch_remove_artifacts; then
+      echo "SPECTRUM: channel off - failed to arm inbound/bridge-supervision poll shim or 20s cadence"
+    else
+      echo "SPECTRUM: channel off - failed to arm inbound/bridge-supervision poll shim or 20s cadence; stale artifacts remain"
+    fi
+  }
+
+  mkdir -p "$STATE" "$CONFIG" 2>/dev/null || { spectrum_watch_arm_failed; return 0; }
+
+  shim_body=$(cat <<EOF
+#!/usr/bin/env bash
+# Auto-generated by fm-bootstrap.sh - fm-spectrum inbound/bridge-supervision poll shim.
+# The watcher runs this each check cycle; output becomes a check: wake.
+export FM_HOME=$(printf '%q' "$FM_HOME")
+exec $(printf '%q' "$FM_ROOT/bin/fm-spectrum-poll.sh")
+EOF
+)
+  write_if_changed "$shim" "$shim_body" || { spectrum_watch_arm_failed; return 0; }
+  chmod +x "$shim" 2>/dev/null || { spectrum_watch_arm_failed; return 0; }
+
+  cadence_body=$(cat <<'EOF'
+# Auto-generated by fm-bootstrap.sh - fm-spectrum watcher cadence.
+# Source this before arming the watcher (see docs/spectrum-backend.md) so
+# fm-watch.sh polls the spectrum check every 20s. Non-spectrum instances have
+# no such file and keep the default 300s cadence.
+export FM_CHECK_INTERVAL=20
+EOF
+)
+  write_if_changed "$cadence" "$cadence_body" || { spectrum_watch_arm_failed; return 0; }
+
+  echo "SPECTRUM: channel on - inbound/bridge-supervision poll armed via state/spectrum-watch.check.sh; 20s watcher cadence in config/spectrum-mode.env"
+}
+
+# fm-spectrum slice 2: ensure the bridge process itself is running (start it
+# fresh, or restart it if its liveness beacon has gone stale) so the channel is
+# always-on without the captain starting it by hand. Idempotent and
+# concurrency-safe (bin/fm-spectrum-ensure-bridge.sh owns the lock/pidfile
+# discipline); a hard no-op when spectrum is not configured. This is the
+# session-start half of bridge supervision - the check-shim wired by
+# spectrum_watch_setup above covers every subsequent watcher cycle for the rest
+# of the session, so a bridge that dies mid-session is caught within one
+# CHECK_INTERVAL, not just at the next session start.
+spectrum_bridge_supervise() {
+  local env_file handle out rc
+  env_file="$FM_HOME/.env"
+  handle=
+  [ -f "$env_file" ] && handle=$(spectrum_env_get SPECTRUM_SELF_HANDLE "$env_file")
+  [ -n "$handle" ] || return 0
+
+  out=$(FM_HOME="$FM_HOME" FM_ROOT_OVERRIDE="$FM_ROOT" FM_STATE_OVERRIDE="$STATE" \
+    "$SCRIPT_DIR/fm-spectrum-ensure-bridge.sh" 2>&1)
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "SPECTRUM: bridge supervision failed - $out"
+  elif [ -n "$out" ]; then
+    case "$out" in
+      *healthy*|*"no beacon yet"*|*"already in progress"*) : ;;  # routine, stay quiet
+      *) echo "SPECTRUM: $out" ;;
+    esac
+  fi
+}
+
 crew_dispatch_validate() {
   local file err
   file="$CONFIG/crew-dispatch.json"
@@ -425,6 +549,8 @@ fi
 if [ "${FM_BOOTSTRAP_DETECT_ONLY:-0}" != 1 ]; then
   secondmate_sync
   x_mode_setup
+  spectrum_watch_setup
+  spectrum_bridge_supervise
   fleet_sync
 fi
 exit 0

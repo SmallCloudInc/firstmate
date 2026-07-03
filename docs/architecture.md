@@ -21,6 +21,7 @@ Crew status files are append-only wake-event logs, not current-state fields.
 Only when no matching run exists does it fall back to the pane busy-signature and then the status log; a dead pane without a run reports unknown instead of trusting a stale log.
 For herdr, that pane fallback trusts a native `busy` verdict outright, but corroborates native `idle` or unknown verdicts against the rendered busy signature before deciding the crew is not working.
 Optional X mode rides the same check path: the locked session-start bootstrap step drops a local `state/x-watch.check.sh` shim only after the user opts in with `FMX_PAIRING_TOKEN`, and non-X homes keep the default watcher behavior.
+The private fm-spectrum iMessage channel rides the identical check path with its own shim (`state/spectrum-watch.check.sh`, opted in via `SPECTRUM_SELF_HANDLE`): each cycle it both supervises the bridge process (idempotent ensure-started/restart via `bin/fm-spectrum-ensure-bridge.sh`) and surfaces a pending inbound message as a wake - see [docs/spectrum-backend.md](spectrum-backend.md).
 
 Routine re-arms go through `bin/fm-watch-arm.sh`, which forks the watcher as a tracked child, verifies it is genuinely alive with a fresh liveness beacon, and prints exactly one honest status line (`started` / `healthy` / `FAILED`, the last exiting non-zero) - never a false `already running` off a dying process.
 Its `--restart` mode signals only the watcher recorded in the current home's `state/.watch.lock`, so restarting one home cannot kill sibling secondmate watchers.
@@ -155,6 +156,20 @@ If an image is attached to a split reply, the relay puts it on the first/opener 
 For preview testing, `FMX_DRY_RUN` makes `fm-x-reply.sh` and `fm-x-dismiss.sh` skip the public post or dismiss call and record the would-be payload under `state/x-outbox/`, including `texts` when the reply would be a thread and an `endpoint` marker when the preview is a completion follow-up or dismiss, while the rest of the poll -> compose -> would-post loop still succeeds.
 Attached images are recorded as compact `{media_type, bytes, source_path}` metadata in dry-run instead of base64 bytes.
 The watcher, wake queue, arm wrapper, and afk daemon are unchanged; X mode is layered on top through the existing check mechanism.
+
+## Optional private iMessage channel (fm-spectrum)
+
+fm-spectrum is a private, two-way iMessage channel directly between the captain and firstmate, built on `spectrum-ts`'s local iMessage mode (no Photon cloud, no account, no network call beyond iMessage's own Apple-to-Apple transport).
+A user enables it by putting `SPECTRUM_SELF_HANDLE` (the bridge's own sending identity) and `SPECTRUM_CAPTAIN_HANDLE` (a comma-separated sender allowlist) in the firstmate home's gitignored `.env`; presence of `SPECTRUM_SELF_HANDLE` is the whole activation signal, exactly like `FMX_PAIRING_TOKEN` for X mode.
+A separate long-running Node bridge process (`bin/fm-spectrum-bridge`) tails inbound iMessages from an allowlisted sender to `state/spectrum-inbox/` and drains `state/spectrum-outbox/` to send outbound via `osascript`-driven Messages.app.
+Unlike X mode, this bridge is firstmate's own always-on child process, not a stateless poll: `bin/fm-spectrum-ensure-bridge.sh` makes it idempotently self-starting and self-healing (single-instance locked, pid-reuse safe, restarts on a stale liveness beacon), invoked both at session-start bootstrap and on every watcher check cycle.
+On the locked session-start bootstrap step, a configured handle creates two local artifacts mirroring X mode's own: `state/spectrum-watch.check.sh`, which supervises the bridge and surfaces a pending inbound message, and `config/spectrum-mode.env`, which sets `FM_CHECK_INTERVAL=20` for watcher arms in that home (tighter than X mode's 30s, since this poll is a local file check with no network round trip).
+Without the handle, the locked session-start bootstrap step removes those artifacts on opt-out and otherwise stays silent, so non-spectrum users see no behavior change.
+Pending messages are stored as `state/spectrum-inbox/<message-id>.json`; the `spectrum-respond` agent-only skill drains that inbox, classifies each message as an actionable request, question, or pure acknowledgment, acts through firstmate's normal lifecycle, and replies through `bin/fm-spectrum-notify.sh`.
+Because every inbound record is bridge-verified against the sender allowlist before it ever reaches disk, and the channel is private to the captain rather than a shared public bot, replies need none of X mode's public-safety scrubbing - destructive/irreversible/security-sensitive requests still require an explicit confirmation round-trip rather than executing straight from a message.
+`bin/fm-spectrum-escalate.sh` auto-pushes a captain-facing escalation (work ready for review, a blocker, a failure, a needed decision) to this channel, but only when the channel is configured AND the captain is away (`state/.afk` present) - a session-attentive captain already sees the normal chat-surfaced escalation, so this stays a silent no-op otherwise.
+For preview testing, `SPECTRUM_DRY_RUN` makes outbound sends record their would-be payload under `state/spectrum-outbox/` (with `dry_run: true`) instead of reaching a live account, while the rest of the loop still succeeds.
+The watcher, wake queue, arm wrapper, and afk daemon are unchanged; fm-spectrum is layered on top through the same check mechanism X mode uses. Full detail lives in [docs/spectrum-backend.md](spectrum-backend.md).
 
 ## Project memory belongs to projects
 
