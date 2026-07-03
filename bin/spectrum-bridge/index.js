@@ -1,0 +1,342 @@
+#!/usr/bin/env node
+'use strict';
+
+// The fm-spectrum iMessage bridge. Launched by ../fm-spectrum-bridge (a bash
+// script that owns all .env/config resolution and gating); this file is a pure
+// logic executor that trusts its environment and never parses .env itself.
+//
+// Inbound: tails app.messages (spectrum-ts local iMessage mode - reads
+// ~/Library/Messages/chat.db directly, no network, no Photon credentials) and
+// writes each allowlisted inbound message atomically to
+// state/spectrum-inbox/<message.id>.json. FM_SPECTRUM_CAPTAIN may list more
+// than one reachable captain handle (comma-separated, e.g. an email and a
+// phone number both signed into iMessage); a message from any of them is
+// allowlisted. Nothing consumes that inbox yet in this slice - wiring it into
+// firstmate's wake queue is a follow-up.
+//
+// Outbound: polls state/spectrum-outbox/ for JSON drop files written by
+// bin/fm-spectrum-notify.sh ({id, target, text, ts, dry_run}) and sends each via
+// osascript-driven Messages.app, unless dry-run (either the file's own
+// dry_run:true, or this process's own FM_SPECTRUM_DRY env) - in which case the
+// send is stubbed (logged, never executed) and the file is still consumed.
+//
+// Liveness: touches state/.spectrum-bridge-beat on a fixed interval so
+// bin/fm-spectrum-status.sh can tell a live bridge from a hung/crashed one.
+// This script never touches bin/fm-watch.sh, fm-watch-arm.sh, fm-wake-lib.sh,
+// or the afk daemon - additive only, per the design.
+
+const fs = require('fs');
+const path = require('path');
+
+function isTruthy(v) {
+  if (!v) return false;
+  switch (String(v).trim().toLowerCase()) {
+    case '':
+    case '0':
+    case 'false':
+    case 'no':
+    case 'off':
+      return false;
+    default:
+      return true;
+  }
+}
+
+// Parse a comma-separated handle list (e.g. SPECTRUM_CAPTAIN_HANDLE, which may
+// name more than one reachable handle for the same captain - an email and a
+// phone number both signed into iMessage). Trims whitespace around each
+// entry and drops empties, so "a@x.com, +1..., " -> ["a@x.com", "+1..."].
+function parseHandleList(raw) {
+  return String(raw || '')
+    .split(',')
+    .map((h) => h.trim())
+    .filter((h) => h.length > 0);
+}
+
+// Inbound sender allowlist: true iff `sender` matches (case-insensitively) any
+// handle in `captainHandles`. A private two-person channel, not a public
+// inbox, so anything not on the list is dropped, never stashed.
+function isFromCaptain(message, captainHandles) {
+  const sender = message?.sender?.handle || message?.sender?.id || message?.sender;
+  if (typeof sender !== 'string') return false;
+  const lowerSender = sender.toLowerCase();
+  return captainHandles.some((h) => h.toLowerCase() === lowerSender);
+}
+
+const STATE = process.env.FM_SPECTRUM_STATE;
+const SELF_HANDLE = process.env.FM_SPECTRUM_SELF;
+const CAPTAIN_HANDLES = parseHandleList(process.env.FM_SPECTRUM_CAPTAIN);
+const DRY_RUN = isTruthy(process.env.FM_SPECTRUM_DRY);
+
+const INBOX_DIR = STATE ? path.join(STATE, 'spectrum-inbox') : null;
+const OUTBOX_DIR = STATE ? path.join(STATE, 'spectrum-outbox') : null;
+const BEACON_PATH = STATE ? path.join(STATE, '.spectrum-bridge-beat') : null;
+
+const BEACON_INTERVAL_MS = 15_000;
+const OUTBOX_POLL_INTERVAL_MS = 2_000;
+
+// The `imessage` export from `@spectrum-ts/imessage`, set once in main() right
+// after the dynamic require succeeds (never at module load, so this file
+// still requires cleanly with no spectrum-ts install). Read only by
+// processOutboxFile's live-send path; resolvePlatformInstance/sendOutbound
+// take it as an explicit parameter instead, so they stay testable in
+// isolation (see tests/fm-spectrum-mode.test.sh).
+let imessagePlatform = null;
+
+function touchBeacon() {
+  try {
+    fs.writeFileSync(BEACON_PATH, `${Date.now()}\n`);
+  } catch (err) {
+    console.error(`fm-spectrum-bridge: failed to touch beacon: ${err.message}`);
+  }
+}
+
+function ensureDirs() {
+  for (const dir of [STATE, INBOX_DIR, OUTBOX_DIR]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+// Atomically write JSON so a concurrent reader (a future poll shim) never sees
+// a half-written file - write to a sibling temp file, then rename.
+function writeJsonAtomic(finalPath, obj) {
+  const tmpPath = `${finalPath}.tmp.${process.pid}`;
+  fs.writeFileSync(tmpPath, JSON.stringify(obj, null, 2) + '\n');
+  fs.renameSync(tmpPath, finalPath);
+}
+
+// The Spectrum() app instance itself does NOT carry a `.space`/`.im` shortcut
+// (its own keys are just __providers, __internal, config, messages, stop,
+// webhook, send, edit, responding - confirmed by introspecting a real
+// constructed instance). The earlier design report's `im.space.get(id)` was
+// read from source, not exercised, and the guessed `app.im.space.get` /
+// `app.space.get` accessors do not exist at runtime - that guess was the bug a
+// live smoke test caught (send silently never reached osascript).
+//
+// The real path: `@spectrum-ts/core`'s `Platform<Def>` interface (the
+// `imessage` export from `@spectrum-ts/imessage`, i.e. the SAME object used to
+// build `imessage.config({...})`) is itself CALLABLE - `imessage(app)`
+// resolves the live `PlatformInstance` for that provider on that app, and
+// PlatformInstance.space is the SpaceNamespace that actually carries
+// `.create(handle)` / `.get(id)`, each resolving to a `Space` with `.send()`.
+// Verified empirically against the installed spectrum-ts@8.2.1 +
+// @spectrum-ts/imessage@8.2.1: `imessage(app).space.create('+1...')` resolves
+// a space whose id matches chat.db's own guid for that handle. See
+// docs/spectrum-backend.md for the introspection trail.
+//
+// `platform` is the `imessage` export from `@spectrum-ts/imessage` (dynamically
+// required in main(), never at module load, so this file still requires
+// cleanly - for the pure helpers below - in an environment with no spectrum-ts
+// install). Takes it as an explicit parameter rather than reading module
+// state so this function is independently testable against a real,
+// dependency-installed Spectrum() app without needing FM_SPECTRUM_* env or a
+// live send: see tests/fm-spectrum-mode.test.sh.
+function resolvePlatformInstance(app, platform) {
+  if (typeof platform !== 'function') {
+    throw new Error(
+      'the imessage platform module was not loaded (spectrum-ts dependencies missing)'
+    );
+  }
+  const instance = platform(app);
+  if (!instance || typeof instance.space?.create !== 'function' || typeof instance.space?.get !== 'function') {
+    throw new Error(
+      'imessage(app) did not return a PlatformInstance with a working space.create()/space.get() - ' +
+        'spectrum-ts API surface may have changed since this was last verified (see docs/spectrum-backend.md)'
+    );
+  }
+  return instance;
+}
+
+// Proactive send to a known handle (email or phone number), no prior inbound
+// event to reply to: resolve-or-create the 1:1 space for that handle, then
+// send. `space.create` is the documented proactive-send primitive for "a
+// single user (1:1 conversation)" identified by a raw handle string.
+async function sendOutbound(app, platform, target, text) {
+  const platformInstance = resolvePlatformInstance(app, platform);
+  const space = await platformInstance.space.create(target);
+  await space.send(text);
+}
+
+async function processOutboxFile(app, filePath) {
+  let record;
+  try {
+    record = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (err) {
+    console.error(`fm-spectrum-bridge: skipping unreadable outbox file ${filePath}: ${err.message}`);
+    fs.unlinkSync(filePath);
+    return;
+  }
+
+  const { target, text, dry_run: fileDryRun } = record;
+  const dry = DRY_RUN || Boolean(fileDryRun);
+
+  if (dry) {
+    console.error(`fm-spectrum-bridge: DRY RUN - would send to ${target}: ${String(text).slice(0, 200)}`);
+  } else {
+    try {
+      await sendOutbound(app, imessagePlatform, target, text);
+      console.error(`fm-spectrum-bridge: sent to ${target}`);
+    } catch (err) {
+      console.error(`fm-spectrum-bridge: send to ${target} failed: ${err.message}`);
+      // Leave the file in place so a restart can retry, rather than silently
+      // dropping a captain-bound escalation.
+      return;
+    }
+  }
+
+  fs.unlinkSync(filePath);
+}
+
+// Files currently being processed. A real iMessage send can outlast the 2s
+// poll interval, so without this guard the next tick would re-read the same
+// still-present file and send it again (double-posting a captain escalation).
+// A filename is added before dispatch and removed only once processing settles
+// (after a successful unlink, or after a failure that intentionally leaves the
+// file in place for the next tick to retry).
+const inFlightOutbox = new Set();
+
+function pollOutbox(app) {
+  let files;
+  try {
+    files = fs
+      .readdirSync(OUTBOX_DIR)
+      .filter((f) => f.endsWith('.json') && !f.startsWith('.'))
+      .sort();
+  } catch (err) {
+    console.error(`fm-spectrum-bridge: cannot read outbox dir: ${err.message}`);
+    return;
+  }
+  for (const file of files) {
+    if (inFlightOutbox.has(file)) continue;
+    inFlightOutbox.add(file);
+    processOutboxFile(app, path.join(OUTBOX_DIR, file))
+      .catch((err) => {
+        console.error(`fm-spectrum-bridge: error processing outbox file ${file}: ${err.message}`);
+      })
+      .finally(() => {
+        inFlightOutbox.delete(file);
+      });
+  }
+}
+
+async function handleInbound(space, message) {
+  if (!isFromCaptain(message, CAPTAIN_HANDLES)) {
+    console.error(`fm-spectrum-bridge: dropping inbound message from non-captain sender (allowlist: ${CAPTAIN_HANDLES.join(', ')})`);
+    return;
+  }
+  if (!message.id) {
+    console.error('fm-spectrum-bridge: dropping inbound message with no id');
+    return;
+  }
+
+  const record = {
+    id: message.id,
+    space_id: space?.id ?? null,
+    space_guid: space?.guid ?? null,
+    sender: message.sender?.handle ?? message.sender ?? null,
+    text: message.content?.text ?? null,
+    content_type: message.content?.type ?? null,
+    timestamp: message.timestamp ? new Date(message.timestamp).toISOString() : null,
+    direction: 'inbound',
+  };
+
+  const finalPath = path.join(INBOX_DIR, `${message.id}.json`);
+  try {
+    writeJsonAtomic(finalPath, record);
+  } catch (err) {
+    console.error(`fm-spectrum-bridge: failed to write inbox record for ${message.id}: ${err.message}`);
+  }
+}
+
+async function main() {
+  ensureDirs();
+
+  let Spectrum, imessage;
+  try {
+    ({ Spectrum } = require('spectrum-ts'));
+    ({ imessage } = require('@spectrum-ts/imessage'));
+  } catch (err) {
+    // This is the expected, graceful-failure path in any environment where
+    // `npm install` has not been run inside bin/spectrum-bridge/ yet
+    // (including CI/dev sandboxes, which cannot exercise the real macOS-only
+    // local iMessage transport anyway). Fail fast and clearly rather than
+    // limping along without the ability to actually bridge messages.
+    console.error(
+      'fm-spectrum-bridge: spectrum-ts dependencies are not installed. ' +
+        'Run: (cd bin/spectrum-bridge && npm install)'
+    );
+    console.error(`fm-spectrum-bridge: underlying error: ${err.message}`);
+    process.exit(1);
+  }
+  imessagePlatform = imessage;
+
+  // Local mode: zero Photon credentials, reads chat.db directly and sends via
+  // osascript-driven Messages.app. See data/spectrum-local-v2/report.md.
+  let app;
+  try {
+    app = await Spectrum({ providers: [imessage.config({ local: true })] });
+  } catch (err) {
+    console.error(`fm-spectrum-bridge: failed to start Spectrum local iMessage client: ${err.message}`);
+    console.error(
+      'fm-spectrum-bridge: this usually means Messages.app is not running/signed in, ' +
+        'or the macOS Full Disk Access / Automation->Messages permissions are not granted. ' +
+        'See docs/spectrum-backend.md.'
+    );
+    process.exit(1);
+  }
+
+  touchBeacon();
+  const beaconTimer = setInterval(touchBeacon, BEACON_INTERVAL_MS);
+  const outboxTimer = setInterval(() => pollOutbox(app), OUTBOX_POLL_INTERVAL_MS);
+
+  let stopping = false;
+  const shutdown = async (signal) => {
+    if (stopping) return;
+    stopping = true;
+    console.error(`fm-spectrum-bridge: received ${signal}, shutting down`);
+    clearInterval(beaconTimer);
+    clearInterval(outboxTimer);
+    try {
+      await app.stop();
+    } catch (err) {
+      console.error(`fm-spectrum-bridge: error during shutdown: ${err.message}`);
+    }
+    process.exit(0);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  console.error(
+    `fm-spectrum-bridge: running as ${SELF_HANDLE} (captain allowlist: ${CAPTAIN_HANDLES.join(', ')}, dry_run=${DRY_RUN})`
+  );
+
+  for await (const [space, message] of app.messages) {
+    await handleInbound(space, message);
+  }
+}
+
+// Only validate environment and actually run when this file is the process
+// entry point (`node index.js`), not when it's require()'d - e.g. by a test
+// that wants the pure helpers above (parseHandleList, isFromCaptain,
+// isTruthy) without needing FM_SPECTRUM_* set or a live Spectrum connection.
+if (require.main === module) {
+  // Defensive: the bash launcher (fm-spectrum-bridge) already gates on these
+  // being present, but this file can be invoked directly (e.g. `node
+  // index.js` during development), so re-validate here rather than trust the
+  // caller.
+  if (!STATE || !SELF_HANDLE || CAPTAIN_HANDLES.length === 0) {
+    console.error(
+      'fm-spectrum-bridge: missing required environment ' +
+        '(FM_SPECTRUM_STATE, FM_SPECTRUM_SELF, FM_SPECTRUM_CAPTAIN) - ' +
+        'run this via bin/fm-spectrum-bridge, not directly.'
+    );
+    process.exit(1);
+  }
+
+  main().catch((err) => {
+    console.error(`fm-spectrum-bridge: fatal error: ${err.stack || err.message}`);
+    process.exit(1);
+  });
+} else {
+  module.exports = { isTruthy, parseHandleList, isFromCaptain, resolvePlatformInstance };
+}

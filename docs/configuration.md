@@ -170,6 +170,15 @@ In dry-run, `fm-x-dismiss.sh` records `{request_id, endpoint:"dismiss"}` to the 
 The live answer and follow-up bodies intentionally stay the same shape, including optional `image`; the relay distinguishes them by endpoint, and dismiss stays `{request_id}`.
 These paths need `jq` to build the JSON payload, but they run before token and network checks, so they need neither `FMX_PAIRING_TOKEN` nor `curl`.
 
+## Spectrum mode (.env)
+
+Spectrum is an opt-in private two-way iMessage channel between the captain and firstmate, mirroring X mode's opt-in discipline.
+It is off unless the firstmate home's gitignored `.env` sets a non-empty `SPECTRUM_SELF_HANDLE`; absent it, every `fm-spectrum-*` script is a hard no-op (exit 0).
+`SPECTRUM_CAPTAIN_HANDLE` is a comma-separated allowlist of the captain's handles: any of them is honored on inbound, and the first is the default outbound target unless `SPECTRUM_TARGET_HANDLE` overrides it.
+`SPECTRUM_DRY_RUN` previews outbound sends (recorded to `state/spectrum-outbox/`) without a live Messages account or bridge process, and `SPECTRUM_ENV_FILE` points direct client invocations at an alternate `.env`-style file for testing.
+Slice 1 ships the bridge, outbound escalations, dry-run, and health checking; inbound wake-queue wiring and a respond skill are deferred.
+Full detail lives in [docs/spectrum-backend.md](spectrum-backend.md).
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
@@ -200,6 +209,12 @@ FMX_DRY_RUN=            # truthy previews X replies and dismissals to state/x-ou
 FMX_X_REPLY_MAX_CHARS=280   # X reply per-tweet split budget; values below 50 clamp to 50
 FMX_X_THREAD_MAX=25     # maximum tweets in one auto-split X reply thread
 FMX_FOLLOWUP_MAX_AGE_SECS=86400   # local window for posting one X completion follow-up
+SPECTRUM_SELF_HANDLE=   # Spectrum iMessage handle the bridge sends as; .env presence is the whole opt-in (absent = every fm-spectrum-* script is a hard no-op)
+SPECTRUM_CAPTAIN_HANDLE=   # comma-separated allowlist of the captain's handles; any is honored inbound, the first is the default outbound target
+SPECTRUM_TARGET_HANDLE=   # optional override of the default outbound target (otherwise the first SPECTRUM_CAPTAIN_HANDLE)
+SPECTRUM_DRY_RUN=       # truthy previews outbound sends to state/spectrum-outbox/ without a live account or bridge
+SPECTRUM_ENV_FILE=      # optional alternate .env file for direct spectrum client invocations (testing)
+SPECTRUM_BRIDGE_STALE_SECS=90   # seconds before fm-spectrum-status.sh calls the bridge liveness beacon stale
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # seconds before guard warnings and arm health checks treat a watcher beacon as stale
 FM_ARM_CONFIRM_TIMEOUT=10   # seconds fm-watch-arm waits to confirm a fresh watcher before reporting FAILED
