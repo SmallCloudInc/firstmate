@@ -150,6 +150,14 @@ async function processOutboxFile(app, filePath) {
   fs.unlinkSync(filePath);
 }
 
+// Files currently being processed. A real iMessage send can outlast the 2s
+// poll interval, so without this guard the next tick would re-read the same
+// still-present file and send it again (double-posting a captain escalation).
+// A filename is added before dispatch and removed only once processing settles
+// (after a successful unlink, or after a failure that intentionally leaves the
+// file in place for the next tick to retry).
+const inFlightOutbox = new Set();
+
 function pollOutbox(app) {
   let files;
   try {
@@ -162,9 +170,15 @@ function pollOutbox(app) {
     return;
   }
   for (const file of files) {
-    processOutboxFile(app, path.join(OUTBOX_DIR, file)).catch((err) => {
-      console.error(`fm-spectrum-bridge: error processing outbox file ${file}: ${err.message}`);
-    });
+    if (inFlightOutbox.has(file)) continue;
+    inFlightOutbox.add(file);
+    processOutboxFile(app, path.join(OUTBOX_DIR, file))
+      .catch((err) => {
+        console.error(`fm-spectrum-bridge: error processing outbox file ${file}: ${err.message}`);
+      })
+      .finally(() => {
+        inFlightOutbox.delete(file);
+      });
   }
 }
 
