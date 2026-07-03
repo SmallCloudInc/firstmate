@@ -257,6 +257,13 @@ If \`AGENTS.md\` or \`CLAUDE.md\` already exists, or if this task produced durab
 If this task produced durable project-intrinsic knowledge, record it in \`AGENTS.md\` as part of your change.
 Keep it proportionate: skip \`AGENTS.md\` edits for trivial tasks that produced no durable project knowledge.
 
+# Sharing screenshots in a PR
+To put an image (a simulator/app screenshot, a UI before/after, testing evidence) into a PR or PR comment, upload it to the shared firstmate R2 bucket and embed the returned public URL — don't commit binaries to the repo (private-repo \`raw.githubusercontent.com\` 404s and won't render):
+\`\`\`
+$FM_ROOT/bin/fm-r2-upload.sh --markdown --prefix <repo>-pr<N> shot.png   # prints the public URL + a ![](...) line
+\`\`\`
+Then reference the URL in the PR body/comment via \`gh-axi\`. The helper is self-contained (pins the SmallCloudInc account, falls back to \`npx wrangler\`); read its header for options.
+
 $DOD
 EOF
 echo "scaffolded: $BRIEF (ship, mode=$MODE; replace {TASK})"

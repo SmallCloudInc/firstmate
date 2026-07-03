@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# fm-r2-upload.sh — upload image(s) to the shared firstmate R2 bucket and print
+# their public URLs, so any firstmate crewmate can embed screenshots / testing
+# evidence in a GitHub PR or comment.
+#
+# Bucket:  firstmate-screenshots  (SmallCloudInc Cloudflare account, public r2.dev)
+# Usage:
+#   fm-r2-upload.sh [--prefix <slug>] <file> [<file> ...]
+#   fm-r2-upload.sh --markdown [--prefix <slug>] <file> [<file> ...]
+#
+# Options:
+#   --prefix <slug>   Key prefix (folder) in the bucket. Default: "<cwd-basename>-<UTC timestamp>".
+#                     Use something stable+unique per PR, e.g. "reader-app-pr25".
+#   --markdown        Also print a ready-to-paste `![name](url)` line per file.
+#
+# Output: one public URL per uploaded file on stdout (markdown lines go to stdout too
+#         under --markdown). Progress/info goes to stderr.
+#
+# Requires: wrangler (uses `wrangler` on PATH, else `npx --yes wrangler@4`) authenticated
+#           to the SmallCloudInc account (the firstmate build box already is).
+set -euo pipefail
+
+BUCKET="firstmate-screenshots"
+PUBLIC_BASE="https://pub-94367ac5ad9a457ea2cf82bb71ef2c3f.r2.dev"
+# Pin the account — the build box is also authed to other accounts; without this
+# wrangler dies with "more than one account available".
+export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-3c445f673c4e1e5dcca897aa7f6c3c30}"
+
+PREFIX=""
+MARKDOWN=0
+FILES=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix) PREFIX="$2"; shift 2 ;;
+    --markdown) MARKDOWN=1; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    --) shift; while [ $# -gt 0 ]; do FILES+=("$1"); shift; done ;;
+    -*) echo "fm-r2-upload: unknown option '$1'" >&2; exit 2 ;;
+    *) FILES+=("$1"); shift ;;
+  esac
+done
+
+if [ "${#FILES[@]}" -eq 0 ]; then
+  echo "fm-r2-upload: no files given. Usage: fm-r2-upload.sh [--prefix <slug>] <file> ..." >&2
+  exit 2
+fi
+
+if [ -z "$PREFIX" ]; then
+  PREFIX="$(basename "$PWD")-$(date -u +%Y%m%d-%H%M%S)"
+fi
+
+if command -v wrangler >/dev/null 2>&1; then
+  WRANGLER=(wrangler)
+else
+  WRANGLER=(npx --yes wrangler@4)
+fi
+
+content_type_for() {
+  case "${1##*.}" in
+    png) echo "image/png" ;;
+    jpg|jpeg) echo "image/jpeg" ;;
+    gif) echo "image/gif" ;;
+    webp) echo "image/webp" ;;
+    svg) echo "image/svg+xml" ;;
+    *) echo "application/octet-stream" ;;
+  esac
+}
+
+for f in "${FILES[@]}"; do
+  if [ ! -f "$f" ]; then
+    echo "fm-r2-upload: file not found: $f" >&2
+    exit 1
+  fi
+  base="$(basename "$f")"
+  key="$PREFIX/$base"
+  ct="$(content_type_for "$f")"
+  echo "fm-r2-upload: uploading $f -> $BUCKET/$key ($ct)" >&2
+  "${WRANGLER[@]}" r2 object put "$BUCKET/$key" --file="$f" --content-type="$ct" --remote >&2
+  url="$PUBLIC_BASE/$key"
+  echo "$url"
+  if [ "$MARKDOWN" -eq 1 ]; then
+    echo "![${base%.*}]($url)"
+  fi
+done
