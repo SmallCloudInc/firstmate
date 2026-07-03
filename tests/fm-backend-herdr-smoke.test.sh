@@ -24,6 +24,14 @@ pass() { printf 'ok - %s\n' "$1"; }
 command -v herdr >/dev/null 2>&1 || { echo "skip: herdr not found"; exit 0; }
 command -v jq >/dev/null 2>&1 || { echo "skip: jq not found (required by the herdr adapter)"; exit 0; }
 
+# An installed-but-too-old herdr (protocol below the verified minimum) is as
+# unusable to this real-herdr suite as an absent one, so skip cleanly - exactly
+# like the not-installed case above - instead of hard-failing the version gate.
+# shellcheck source=bin/fm-backend.sh
+. "$ROOT/bin/fm-backend.sh"
+fm_backend_source herdr >/dev/null 2>&1 || { echo "skip: could not source the herdr adapter"; exit 0; }
+fm_backend_herdr_version_check >/dev/null 2>&1 || { echo "skip: installed herdr is older than the verified minimum protocol"; exit 0; }
+
 # shellcheck source=tests/herdr-test-safety.sh
 . "$ROOT/tests/herdr-test-safety.sh"
 

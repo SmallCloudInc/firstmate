@@ -71,7 +71,7 @@ README.md            public overview and development notes
 .tasks.toml          tracked tasks-axi markdown backend config for the default backlog backend (section 10)
 .agents/skills/      shared skills, committed
 .claude/skills       symlink to .agents/skills for claude compatibility
-bin/                 helper scripts, committed; read each script's header before first use
+bin/                 helper scripts, committed, including fm-fleet-sync.sh for clean default-branch refreshes and gone-branch pruning, and fm-r2-upload.sh to host images on the shared firstmate R2 bucket for embedding in PRs (see section 6 > Sharing visual evidence); read each script's header before first use
 .env                 optional X-mode pairing token; LOCAL, gitignored; presence-gates section 14
 config/crew-harness  crewmate harness override; LOCAL, gitignored; absent or "default" = same as firstmate. Inherited: the primary pushes this into every secondmate home's config/ (section 4), so a secondmate's own crewmates use the primary's value
 config/crew-dispatch.json  optional crewmate dispatch profiles; LOCAL, gitignored; firstmate-maintained but human-editable natural-language rules that choose a per-task harness/model/effort profile (section 4). Inherited by secondmate homes
@@ -432,6 +432,18 @@ Touch nothing else.
 `direct-PR` and `local-only` projects skip init entirely - they do not run the pipeline (`local-only` has no remote at all).
 
 If `no-mistakes doctor` reports problems, fix the environment (auth, daemon) before dispatching work to that project.
+
+### Sharing visual evidence (screenshots in PRs)
+
+Any project's crewmate can embed images — simulator/app screenshots, UI before/after, testing evidence — in a GitHub PR or comment. Host them on the shared firstmate R2 bucket and reference the public URL; never commit binaries to the repo (a private repo's `raw.githubusercontent.com` 404s, so committed images don't render in PR comments).
+
+```sh
+bin/fm-r2-upload.sh --markdown --prefix <repo>-pr<N> shot1.png shot2.png   # uploads, prints public URL + ![](...) per file
+```
+
+- **Bucket:** `firstmate-screenshots` (SmallCloudInc Cloudflare account `3c445f673c4e1e5dcca897aa7f6c3c30`, public). Base URL `https://pub-94367ac5ad9a457ea2cf82bb71ef2c3f.r2.dev/<prefix>/<file>`.
+- The helper is self-contained: it pins the account id and uses `wrangler` on PATH or falls back to `npx --yes wrangler@4` (the build box is already authed). Read its header for options (`--prefix`, `--markdown`).
+- Use a stable `--prefix` per PR (e.g. `reader-app-pr25`) so re-uploads overwrite in place and the PR stays readable. The crewmate ship brief (`fm-brief.sh`) points crewmates here.
 
 ## 7. Task lifecycle
 
