@@ -34,11 +34,12 @@ up the next slice), but nothing consumes that inbox yet.
   works). `SPECTRUM_CAPTAIN_HANDLE` lists both, comma-separated (see
   Config below).
 
-**One manual prerequisite for the captain:** switch Messages.app on the Mac
-mini to be signed into `lily.lotuscloud@gmail.com` (keep `tharshan09@gmail.com`
-signed in wherever it's needed for Xcode/dev work - just not in the Messages.app
-session the bridge drives). Until that switch happens, do not run the bridge
-live; dry-run needs no live account at all (see below).
+**Manual prerequisite for the captain (done):** Messages.app on the Mac mini is
+now signed into `lily.lotuscloud@gmail.com` (`tharshan09@gmail.com` stays
+available elsewhere for Xcode/dev work - just not in the Messages.app session
+the bridge drives). A real outbound send was verified live against this setup
+(see "Live verification" below); dry-run remains the no-account-needed path
+for iterating on the bridge without live sends.
 
 Two macOS TCC (Transparency, Consent & Control) grants are also needed on
 whatever machine runs the bridge, both one-time interactive approvals:
@@ -106,16 +107,42 @@ The bridge:
 3. Polls `state/spectrum-outbox/` every 2s for JSON drop files
    (`{id, target, text, ts, dry_run}`, written by `fm-spectrum-notify.sh`) and,
    unless dry-run (the bridge's own `SPECTRUM_DRY_RUN`, or the file's own
-   `dry_run: true`), sends via `space.get(target).send(text)`. Sent (or
-   stubbed) files are removed; a failed live send is left in place so a
-   restart can retry rather than silently dropping a captain-bound
+   `dry_run: true`), sends via `imessage(app).space.create(target).send(text)`.
+   Sent (or stubbed) files are removed; a failed live send is left in place so
+   a restart can retry rather than silently dropping a captain-bound
    escalation.
 4. Touches `state/.spectrum-bridge-beat` every 15s.
 
-**Dependencies are pinned but not installed by this PR.** `bin/spectrum-bridge/package.json`
+**The outbound accessor.** The `Spectrum()` app instance itself does not carry
+a `.space`/`.im` shortcut - its own keys are just `__providers`, `__internal`,
+`config`, `messages`, `stop`, `webhook`, `send`, `edit`, `responding` (confirmed
+by introspecting a real constructed instance). The real path is
+`@spectrum-ts/core`'s `Platform<Def>` interface: the `imessage` export from
+`@spectrum-ts/imessage` (the same object used to build
+`imessage.config({...})`) is itself **callable** - `imessage(app)` resolves the
+live `PlatformInstance` for that provider on that app, and
+`PlatformInstance.space` is the `SpaceNamespace` that actually carries
+`.create(handle)` / `.get(id)`, each resolving to a `Space` with `.send()`.
+This was verified empirically against the installed `spectrum-ts@8.2.1` +
+`@spectrum-ts/imessage@8.2.1`: `imessage(app).space.create('+1...')` resolves a
+space whose id matches chat.db's own guid for that handle
+(`bin/spectrum-bridge/index.js`'s `resolvePlatformInstance()`, covered by
+`tests/fm-spectrum-mode.test.sh`'s `test_bridge_resolves_real_space_accessor`,
+which exercises this against the real installed package so a future
+spectrum-ts upgrade that moves this API fails a test instead of a live send).
+
+An earlier version of this code guessed `app.im.space.get`/`app.space.get`,
+neither of which exists at runtime - a live smoke test caught it (the send
+silently never reached `osascript`; no exception outside the guessed-accessor
+error). That guess was never exercised against a real `spectrum-ts` install
+before this fix.
+
+**Dependencies are pinned and installed for live testing.** `bin/spectrum-bridge/package.json`
 pins `spectrum-ts@8.2.1` and `@spectrum-ts/imessage@8.2.1` - the exact versions
-the design report source-verified. Before running the bridge live, install
-them:
+the design report source-verified and this fix was verified against.
+`bin/spectrum-bridge/node_modules/` is gitignored (reinstall with the command
+below); `bin/spectrum-bridge/package-lock.json` is committed for reproducible
+installs.
 
 ```sh
 (cd bin/spectrum-bridge && npm install)
@@ -201,6 +228,29 @@ logs what it would have sent and never calls `osascript`. That's also the way
 to sanity-check the bridge's Spectrum wiring end to end without ever emitting a
 real message.
 
-**Live end-to-end (a real bridge process, a real send) is deferred pending the
-captain's Messages-account switch** described above, and was not exercised in
-this PR.
+## Live verification
+
+A real outbound send was verified end to end: `fm-spectrum-notify.sh --target
++12262246894 --text-file <file>` against a live `bin/fm-spectrum-bridge`
+(Messages.app signed into `lily.lotuscloud@gmail.com`) produced a new
+`message` row in `chat.db` with `is_from_me=1`,
+`account=E:lily.lotuscloud@gmail.com`, to `+12262246894`, whose
+`attributedBody` decoded to the exact sent text. The dry-run path could not
+have caught the accessor bug above (it stubs the send before touching
+`osascript`), which is why this live pass mattered.
+
+**A macOS caveat worth knowing for unattended operation:** window/chat-touching
+AppleEvents to Messages.app (`count windows`, `chat id "..." `, and the send
+path itself) can hang for a fixed ~2 minutes and fail with `-1712` ("AppleEvent
+timed out") when the console session is locked or otherwise not the active
+foreground session - even though app-level AppleEvents (`get name`) return
+instantly and the Automation→Messages TCC grant is genuinely in place. This is
+distinct from the TCC permission-prompt hang `data/spectrum-local-v2/report.md`
+documents (a one-time interactive Allow); it recurred on every attempt while
+the console was inactive and cleared once the session was active, and
+restarting Messages.app did not help. Keep the console session that runs the
+bridge unlocked/active, or expect sends to fail with this timeout. Inbound
+verification (a real captain message landing in `state/spectrum-inbox/`) was
+not exercised in this pass - it requires the captain to send a live message
+while the bridge is running, which is cheap to check the next time the bridge
+is live but wasn't independently triggerable here.

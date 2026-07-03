@@ -75,6 +75,14 @@ const BEACON_PATH = STATE ? path.join(STATE, '.spectrum-bridge-beat') : null;
 const BEACON_INTERVAL_MS = 15_000;
 const OUTBOX_POLL_INTERVAL_MS = 2_000;
 
+// The `imessage` export from `@spectrum-ts/imessage`, set once in main() right
+// after the dynamic require succeeds (never at module load, so this file
+// still requires cleanly with no spectrum-ts install). Read only by
+// processOutboxFile's live-send path; resolvePlatformInstance/sendOutbound
+// take it as an explicit parameter instead, so they stay testable in
+// isolation (see tests/fm-spectrum-mode.test.sh).
+let imessagePlatform = null;
+
 function touchBeacon() {
   try {
     fs.writeFileSync(BEACON_PATH, `${Date.now()}\n`);
@@ -97,26 +105,55 @@ function writeJsonAtomic(finalPath, obj) {
   fs.renameSync(tmpPath, finalPath);
 }
 
-// spectrum-ts's Space/User accessor naming for a proactive (not
-// reply-triggered) send is not fully pinned down by the design report - it
-// cites `im.space.get(id).send(...)` where `im` is a provider-specific handle,
-// but the exact property Spectrum() exposes that handle under was not
-// independently re-verified for the bridge implementation. Try the documented
-// shapes in order and fail loudly (never guess-and-send) if none match, so a
-// live account never gets a malformed call.
-async function resolveSpaceGetter(app) {
-  if (app.im && typeof app.im.space?.get === 'function') return app.im.space.get.bind(app.im.space);
-  if (typeof app.space?.get === 'function') return app.space.get.bind(app.space);
-  throw new Error(
-    'could not find a space.get(id) accessor on the Spectrum app instance ' +
-      '(tried app.im.space.get and app.space.get) - spectrum-ts API surface ' +
-      'may have changed since data/spectrum-local-v2/report.md was written'
-  );
+// The Spectrum() app instance itself does NOT carry a `.space`/`.im` shortcut
+// (its own keys are just __providers, __internal, config, messages, stop,
+// webhook, send, edit, responding - confirmed by introspecting a real
+// constructed instance). The earlier design report's `im.space.get(id)` was
+// read from source, not exercised, and the guessed `app.im.space.get` /
+// `app.space.get` accessors do not exist at runtime - that guess was the bug a
+// live smoke test caught (send silently never reached osascript).
+//
+// The real path: `@spectrum-ts/core`'s `Platform<Def>` interface (the
+// `imessage` export from `@spectrum-ts/imessage`, i.e. the SAME object used to
+// build `imessage.config({...})`) is itself CALLABLE - `imessage(app)`
+// resolves the live `PlatformInstance` for that provider on that app, and
+// PlatformInstance.space is the SpaceNamespace that actually carries
+// `.create(handle)` / `.get(id)`, each resolving to a `Space` with `.send()`.
+// Verified empirically against the installed spectrum-ts@8.2.1 +
+// @spectrum-ts/imessage@8.2.1: `imessage(app).space.create('+1...')` resolves
+// a space whose id matches chat.db's own guid for that handle. See
+// docs/spectrum-backend.md for the introspection trail.
+//
+// `platform` is the `imessage` export from `@spectrum-ts/imessage` (dynamically
+// required in main(), never at module load, so this file still requires
+// cleanly - for the pure helpers below - in an environment with no spectrum-ts
+// install). Takes it as an explicit parameter rather than reading module
+// state so this function is independently testable against a real,
+// dependency-installed Spectrum() app without needing FM_SPECTRUM_* env or a
+// live send: see tests/fm-spectrum-mode.test.sh.
+function resolvePlatformInstance(app, platform) {
+  if (typeof platform !== 'function') {
+    throw new Error(
+      'the imessage platform module was not loaded (spectrum-ts dependencies missing)'
+    );
+  }
+  const instance = platform(app);
+  if (!instance || typeof instance.space?.create !== 'function' || typeof instance.space?.get !== 'function') {
+    throw new Error(
+      'imessage(app) did not return a PlatformInstance with a working space.create()/space.get() - ' +
+        'spectrum-ts API surface may have changed since this was last verified (see docs/spectrum-backend.md)'
+    );
+  }
+  return instance;
 }
 
-async function sendOutbound(app, target, text) {
-  const getSpace = await resolveSpaceGetter(app);
-  const space = await getSpace(target);
+// Proactive send to a known handle (email or phone number), no prior inbound
+// event to reply to: resolve-or-create the 1:1 space for that handle, then
+// send. `space.create` is the documented proactive-send primitive for "a
+// single user (1:1 conversation)" identified by a raw handle string.
+async function sendOutbound(app, platform, target, text) {
+  const platformInstance = resolvePlatformInstance(app, platform);
+  const space = await platformInstance.space.create(target);
   await space.send(text);
 }
 
@@ -137,7 +174,7 @@ async function processOutboxFile(app, filePath) {
     console.error(`fm-spectrum-bridge: DRY RUN - would send to ${target}: ${String(text).slice(0, 200)}`);
   } else {
     try {
-      await sendOutbound(app, target, text);
+      await sendOutbound(app, imessagePlatform, target, text);
       console.error(`fm-spectrum-bridge: sent to ${target}`);
     } catch (err) {
       console.error(`fm-spectrum-bridge: send to ${target} failed: ${err.message}`);
@@ -231,6 +268,7 @@ async function main() {
     console.error(`fm-spectrum-bridge: underlying error: ${err.message}`);
     process.exit(1);
   }
+  imessagePlatform = imessage;
 
   // Local mode: zero Photon credentials, reads chat.db directly and sends via
   // osascript-driven Messages.app. See data/spectrum-local-v2/report.md.
@@ -300,5 +338,5 @@ if (require.main === module) {
     process.exit(1);
   });
 } else {
-  module.exports = { isTruthy, parseHandleList, isFromCaptain };
+  module.exports = { isTruthy, parseHandleList, isFromCaptain, resolvePlatformInstance };
 }

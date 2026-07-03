@@ -347,6 +347,56 @@ test_bridge_captain_allowlist_accepts_any_listed_handle() {
   pass "fm-spectrum-bridge's inbound allowlist accepts any handle in a comma-separated SPECTRUM_CAPTAIN_HANDLE list"
 }
 
+test_bridge_resolves_real_space_accessor() {
+  command -v node >/dev/null 2>&1 || { pass "bridge space-accessor unit test skipped (no node on PATH)"; return; }
+  [ -d "$ROOT/bin/spectrum-bridge/node_modules/spectrum-ts" ] || {
+    pass "bridge space-accessor unit test skipped (spectrum-ts is not installed in this checkout)"
+    return
+  }
+  # Regression coverage for a live-smoke-test bug: resolvePlatformInstance()
+  # used to guess app.im.space.get / app.space.get, neither of which exists on
+  # a real Spectrum() app instance, so every outbound send silently failed
+  # before ever reaching osascript. This exercises the fix against the REAL
+  # installed spectrum-ts + @spectrum-ts/imessage (constructing a genuine
+  # local-mode app and resolving a real space), so a future spectrum-ts
+  # upgrade that changes this API surface fails a test instead of a live send.
+  # It deliberately stops short of space.send() - that needs a live Messages.app
+  # window and is covered by the live smoke test, not this hermetic suite.
+  local out rc
+  out=$(cd "$ROOT/bin/spectrum-bridge" && node -e '
+    const { Spectrum } = require("spectrum-ts");
+    const { imessage } = require("@spectrum-ts/imessage");
+    const { resolvePlatformInstance } = require("./index.js");
+    (async () => {
+      const app = await Spectrum({ providers: [imessage.config({ local: true })] });
+      try {
+        const platformInstance = resolvePlatformInstance(app, imessage);
+        const space = await platformInstance.space.create("+12262246894");
+        console.log(JSON.stringify({
+          hasCreate: typeof platformInstance.space.create,
+          hasGet: typeof platformInstance.space.get,
+          spaceId: space.id,
+          hasSend: typeof space.send,
+        }));
+      } finally {
+        await app.stop();
+      }
+    })().catch((e) => { console.error("ERR " + e.message); process.exit(1); });
+  ' 2>&1); rc=$?
+  expect_code 0 "$rc" "bridge space-accessor unit test exit"
+  local parsed
+  parsed=$(printf '%s\n' "$out" | grep '"hasCreate"')
+  [ "$(printf '%s' "$parsed" | jq -r .hasCreate)" = "function" ] \
+    || fail "resolvePlatformInstance must return a PlatformInstance with a real space.create (got: $out)"
+  [ "$(printf '%s' "$parsed" | jq -r .hasGet)" = "function" ] \
+    || fail "resolvePlatformInstance must return a PlatformInstance with a real space.get (got: $out)"
+  [ "$(printf '%s' "$parsed" | jq -r .hasSend)" = "function" ] \
+    || fail "the resolved space must carry a real send() (got: $out)"
+  [ "$(printf '%s' "$parsed" | jq -r .spaceId)" = "any;-;+12262246894" ] \
+    || fail "resolved space id must match spectrum-ts's own id scheme for the handle (got: $out)"
+  pass "fm-spectrum-bridge's resolvePlatformInstance resolves a real, working space accessor against installed spectrum-ts"
+}
+
 test_bridge_fails_gracefully_when_dependencies_missing() {
   command -v node >/dev/null 2>&1 || { pass "fm-spectrum-bridge dependency-missing check skipped (no node on PATH)"; return; }
   [ ! -d "$ROOT/bin/spectrum-bridge/node_modules/spectrum-ts" ] || {
@@ -390,4 +440,5 @@ test_status_stale_with_old_beacon
 test_bridge_hard_noop_unconfigured
 test_bridge_requires_captain_allowlist
 test_bridge_captain_allowlist_accepts_any_listed_handle
+test_bridge_resolves_real_space_accessor
 test_bridge_fails_gracefully_when_dependencies_missing
