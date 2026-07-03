@@ -56,7 +56,8 @@ else
 fi
 
 content_type_for() {
-  case "${1##*.}" in
+  ext="${1##*.}"
+  case "$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')" in
     png) echo "image/png" ;;
     jpg|jpeg) echo "image/jpeg" ;;
     gif) echo "image/gif" ;;
@@ -66,14 +67,22 @@ content_type_for() {
   esac
 }
 
+# Slugify a filename into a URL-safe object-key segment: any character outside
+# [A-Za-z0-9._-] becomes '-', runs collapse, and leading/trailing '-' are trimmed.
+safe_key_segment() {
+  printf '%s' "$1" | LC_ALL=C sed -E 's/[^A-Za-z0-9._-]+/-/g; s/-+/-/g; s/^-+//; s/-+$//'
+}
+
 for f in "${FILES[@]}"; do
   if [ ! -f "$f" ]; then
     echo "fm-r2-upload: file not found: $f" >&2
     exit 1
   fi
   base="$(basename "$f")"
-  key="$PREFIX/$base"
   ct="$(content_type_for "$f")"
+  safe_base="$(safe_key_segment "$base")"
+  [ -n "$safe_base" ] || safe_base="file"
+  key="$PREFIX/$safe_base"
   echo "fm-r2-upload: uploading $f -> $BUCKET/$key ($ct)" >&2
   "${WRANGLER[@]}" r2 object put "$BUCKET/$key" --file="$f" --content-type="$ct" --remote >&2
   url="$PUBLIC_BASE/$key"
