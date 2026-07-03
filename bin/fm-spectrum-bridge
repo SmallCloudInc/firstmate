@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Launch the fm-spectrum iMessage bridge: a small long-running Node process that
+# tails the captain's inbound iMessages (local mode - no Photon, no network) and
+# drains state/spectrum-outbox/ to send outbound messages via osascript-driven
+# Messages.app. See docs/spectrum-backend.md for the full picture.
+#
+# This launcher owns config resolution and gating (bash, matching every other
+# fm-spectrum-*/fm-x-* script); the Node side (bin/spectrum-bridge/index.js)
+# is a pure logic executor that never reads .env itself - it only sees the
+# resolved environment this launcher exports.
+#
+# Inert by default: a HARD no-op (exit 0, no output) unless spectrum is
+# configured via a non-empty SPECTRUM_SELF_HANDLE (from the home's .env or the
+# environment) - mirroring fm-x-poll.sh's activation contract exactly.
+#
+# Runs in the foreground until stopped (Ctrl-C, or a signal from whatever
+# supervises it); start it backgrounded (e.g. `nohup bin/fm-spectrum-bridge
+# >>state/spectrum-bridge.log 2>&1 &`) for real use. Full watcher supervision is
+# a follow-up slice; this slice provides the liveness beacon
+# (state/.spectrum-bridge-beat) and bin/fm-spectrum-status.sh reads it.
+set -u
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FM_ROOT="${FM_ROOT_OVERRIDE:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
+STATE="${FM_STATE_OVERRIDE:-$FM_HOME/state}"
+# shellcheck source=bin/fm-spectrum-lib.sh
+. "$SCRIPT_DIR/fm-spectrum-lib.sh"
+
+spectrum_load_config
+
+# Hard no-op when spectrum is off: this is what keeps the process inert until a
+# captain opts in, exactly like fm-x-poll.sh without FMX_PAIRING_TOKEN.
+if ! spectrum_configured; then
+  exit 0
+fi
+
+if [ -z "$SPECTRUM_CAPTAIN" ]; then
+  echo "fm-spectrum-bridge: SPECTRUM_SELF_HANDLE is set but SPECTRUM_CAPTAIN_HANDLE is missing - refusing to start without a sender allowlist" >&2
+  exit 1
+fi
+
+command -v node >/dev/null 2>&1 || {
+  echo "fm-spectrum-bridge: node not found on PATH" >&2
+  exit 1
+}
+
+mkdir -p "$STATE" 2>/dev/null || {
+  echo "fm-spectrum-bridge: cannot create state dir: $STATE" >&2
+  exit 1
+}
+
+exec env \
+  FM_SPECTRUM_STATE="$STATE" \
+  FM_SPECTRUM_SELF="$SPECTRUM_SELF" \
+  FM_SPECTRUM_CAPTAIN="$SPECTRUM_CAPTAIN" \
+  FM_SPECTRUM_DRY="$SPECTRUM_DRY" \
+  node "$SCRIPT_DIR/spectrum-bridge/index.js"

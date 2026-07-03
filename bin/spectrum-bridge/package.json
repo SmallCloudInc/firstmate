@@ -1,0 +1,15 @@
+{
+  "name": "fm-spectrum-bridge",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Long-running bridge for firstmate's private captain<->firstmate iMessage channel (spectrum-ts, local mode - no Photon, no network). Launched by ../fm-spectrum-bridge, never run directly.",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "spectrum-ts": "8.2.1",
+    "@spectrum-ts/imessage": "8.2.1"
+  }
+}
