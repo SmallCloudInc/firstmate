@@ -30,6 +30,14 @@
 #
 # Bounded and fast: no network calls (the bridge already does the reading),
 # so this never needs curl or holds a check cycle open.
+#
+# A persistently failing ensure-bridge call is deduped like fm-x-poll.sh's
+# relay diagnostics: repeating the identical error every ~20s check cycle
+# would wake firstmate needlessly, so only a NEW/changed error message wakes
+# again (state/spectrum-poll.error is the marker, mirroring state/x-poll.error).
+#
+# SPECTRUM_ENSURE_BRIDGE_BIN overrides the ensure-bridge script path (testing
+# only; normal use execs the sibling bin/fm-spectrum-ensure-bridge.sh).
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,18 +52,38 @@ spectrum_load_config
 # Hard no-op when spectrum is off: this is what keeps the check shim inert.
 spectrum_configured || exit 0
 
+ERROR_FILE="$STATE/spectrum-poll.error"
+
+emit_error_once() {
+  local msg=$1
+  mkdir -p "$STATE" 2>/dev/null || true
+  if [ -f "$ERROR_FILE" ] && [ "$(cat "$ERROR_FILE" 2>/dev/null)" = "$msg" ]; then
+    return 0
+  fi
+  printf '%s\n' "$msg" > "$ERROR_FILE" 2>/dev/null || true
+  printf 'spectrum-bridge-error %s\n' "$msg"
+}
+
+clear_error() {
+  rm -f "$ERROR_FILE" 2>/dev/null || true
+}
+
 # --- 1. supervision ----------------------------------------------------------
+ENSURE_BRIDGE_BIN="${SPECTRUM_ENSURE_BRIDGE_BIN:-$SCRIPT_DIR/fm-spectrum-ensure-bridge.sh}"
 ensure_out=
 ensure_rc=0
-ensure_out=$("$SCRIPT_DIR/fm-spectrum-ensure-bridge.sh" 2>&1) || ensure_rc=$?
+ensure_out=$("$ENSURE_BRIDGE_BIN" 2>&1) || ensure_rc=$?
 
 if [ "$ensure_rc" -ne 0 ]; then
-  printf 'spectrum-bridge-error %s\n' "$ensure_out"
-elif [ -n "$ensure_out" ]; then
-  case "$ensure_out" in
-    *healthy*|*"no beacon yet"*|*"already in progress"*) : ;;  # routine, stay quiet
-    *) printf '%s\n' "$ensure_out" ;;  # started / restarting: worth a wake
-  esac
+  emit_error_once "$ensure_out"
+else
+  clear_error
+  if [ -n "$ensure_out" ]; then
+    case "$ensure_out" in
+      *healthy*|*"no beacon yet"*|*"already in progress"*) : ;;  # routine, stay quiet
+      *) printf '%s\n' "$ensure_out" ;;  # started / restarting: worth a wake
+    esac
+  fi
 fi
 
 # --- 2. inbound ---------------------------------------------------------------
