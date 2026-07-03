@@ -78,6 +78,7 @@ tests/fm-grok-harness.test.sh             # grok adapter spawn hook, token guard
 tests/fm-fleet-sync.test.sh               # project clone refresh: safe detached recovery, STUCK drift reports, benign skips, and bootstrap relay
 tests/fm-x-mode.test.sh                   # X-mode poll, inbox context round-trip, reply threading, dismiss, dry-run preview, and .env-presence activation tests
 tests/fm-spectrum-mode.test.sh            # fm-spectrum (private captain<->firstmate iMessage channel, slice 1): shared lib config resolution, notify outbox drop and target defaulting, status beacon states, .env-presence inertness, dry-run preview, and bridge launcher dependency-missing failure
+tests/fm-spectrum-mode-p2.test.sh         # fm-spectrum slice 2 (always-on, two-way): inbound check-shim wake production, beacon-state/inbox-list lib helpers, ensure-bridge idempotency/single-instance-lock/pid-reuse-safety/stale-restart against a fake bridge binary, away-mode-gated auto-push escalation, and bootstrap wiring of the watch shim + bridge supervision
 tests/fm-tangle-guard.test.sh             # primary-checkout tangle detection, read-only remediation suppression, and spawn/brief isolation tests
 tests/fm-spawn-batch.test.sh              # batch dispatch and FM_HOME project-path scoping tests
 tests/fm-spawn-dispatch-profile.test.sh   # concrete dispatch profile flags: active-profile backstop, harness/model/effort meta, launch templates, batch forwarding, and secondmate exemption
