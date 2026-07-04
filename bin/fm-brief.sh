@@ -211,9 +211,6 @@ You drive no-mistakes by responding to its gates, not by implementing fixes.
 Follow the no-mistakes guidance for the mechanics: it loads when you invoke /no-mistakes, and \`no-mistakes axi run --help\` plus the \`help\` lines in each \`axi\` response are authoritative and version-matched to the installed binary.
 Do not hand-edit, commit, or fix findings yourself while a run is active - the pipeline applies every fix.
 
-Before your first \`no-mistakes axi run\`, run a plain push from your shell: \`git push no-mistakes fm/$ID\` (the \`no-mistakes\` git remote - confirm that remote name).
-This works around a known no-mistakes bug where the internal push made by \`no-mistakes axi run\` is rejected by the gate, so this plain push creates the gate run row first; \`no-mistakes axi run\` then reattaches to that existing run and drives the pipeline as normal.
-
 Two firstmate-specific rules layer on top of that guidance:
 - ask-user findings are not yours to answer: escalate to firstmate (rule 6) and stop.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
