@@ -113,7 +113,7 @@ The decision persists for the repo, so later worktrees of the same project skip 
 Resume after exit with `codex resume <session-id>`.
 The session id is printed on quit.
 
-## opencode (VERIFIED 2026-06-11, v1.15.7-1.17.3)
+## opencode (VERIFIED 2026-06-11, v1.15.7-1.17.3; autonomy flag re-verified 2026-07-08, v1.17.13)
 
 | Fact | Value |
 |---|---|
@@ -125,6 +125,16 @@ No trust dialog.
 Opencode can auto-upgrade itself in the background and the running TUI can exit mid-task, observed live from 1.15.7 to 1.17.3.
 If a pane shows the exit banner, relaunch with `--continue` to resume the session.
 `--prompt` does not auto-submit alongside `--continue`, so send the next instruction via `fm-send` once the TUI is up.
+
+**Autonomy: use `--auto`, not an `OPENCODE_CONFIG_CONTENT` permission env var.**
+The launch template previously prefixed the command with `OPENCODE_CONFIG_CONTENT='{"permission":{"*":"allow"}}'`, but that wildcard permission schema does not take effect on opencode 1.17.13 - a live crewmate still prompted the captain for file-edit approval.
+opencode 1.17.13 has a documented CLI flag instead: `--auto` ("auto-approve permissions that are not explicitly denied (dangerous!)").
+`fm-spawn`'s template is now `opencode __MODELFLAG__--auto --prompt "$(cat __BRIEF__)"`.
+Empirically verified on 1.17.13 in a bounded, non-interactive smoke test (a trivial file-edit prompt, killed after a fixed time bound if it hung):
+- A native opencode model (`opencode/*`, no `--model` flag) completed the edit unattended with `--auto`, no prompt.
+- `--model cursor-acp/composer-2.5` (the ACP-bridged Cursor Composer model, the specific combo that produced the captain's approval prompts) also completed the edit unattended with `--auto`, no prompt - `--auto` is not bypassed by ACP-bridged models.
+- The stale `"*":"allow"` wildcard config was dropped entirely rather than kept alongside `--auto`; testing did not surface a case where it added anything `--auto` did not already cover, so the smaller change (flag only) was kept.
+- Note: this was verified in a headless test harness, not inside a live tmux crewmate pane; if a future report surfaces prompts again under `--auto`, re-verify inside an actual spawned pane before assuming the flag itself regressed.
 
 ## pi (VERIFIED 2026-06-11)
 
