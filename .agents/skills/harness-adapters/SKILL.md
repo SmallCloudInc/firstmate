@@ -120,6 +120,7 @@ The session id is printed on quit.
 | Busy-pane signature | `esc interrupt` (dotted spinner footer; note no "to") |
 | Exit command | `/exit` |
 | Interrupt | double Escape; known flaky while a long shell command runs, so a wedged pane may need `/exit` and relaunch |
+| Autonomy | `--auto` ("auto-approve permissions that are not explicitly denied"); required on every launch and relaunch, see below |
 
 No trust dialog.
 Opencode can auto-upgrade itself in the background and the running TUI can exit mid-task, observed live from 1.15.7 to 1.17.3.
