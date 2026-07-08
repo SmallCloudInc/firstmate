@@ -123,7 +123,7 @@ The session id is printed on quit.
 
 No trust dialog.
 Opencode can auto-upgrade itself in the background and the running TUI can exit mid-task, observed live from 1.15.7 to 1.17.3.
-If a pane shows the exit banner, relaunch with `--continue` to resume the session.
+If a pane shows the exit banner, relaunch with `--auto --continue` to resume the session; `--auto` is not persisted in the session, so omitting it on relaunch brings the crewmate back without autonomy.
 `--prompt` does not auto-submit alongside `--continue`, so send the next instruction via `fm-send` once the TUI is up.
 
 **Autonomy: use `--auto`, not an `OPENCODE_CONFIG_CONTENT` permission env var.**
