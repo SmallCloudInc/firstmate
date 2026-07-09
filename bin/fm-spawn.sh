@@ -239,7 +239,13 @@ launch_template() {
         printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(cat __BRIEF__)"'
       fi
       ;;
-    opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(cat __BRIEF__)"' ;;
+    # The "*":"allow" wildcard permission schema does not take effect on the
+    # installed opencode 1.17.13 (verified: crewmates still prompted for
+    # approval). --auto ("auto-approve permissions that are not explicitly
+    # denied") is the documented, verified flag for unattended runs, and it
+    # covers cursor-acp/composer models the same as native opencode models -
+    # see the harness-adapters skill for the empirical verification.
+    opencode) printf '%s' 'opencode __MODELFLAG__--auto --prompt "$(cat __BRIEF__)"' ;;
     pi)
       if [ "$kind" = secondmate ]; then
         printf '%s' 'pi __MODELFLAG____EFFORTFLAG__"$(cat __BRIEF__)"'
