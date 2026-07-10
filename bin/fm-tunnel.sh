@@ -7,8 +7,8 @@
 #   fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] \
 #                              [--service <url>] [--emails <e1,e2,...>] \
 #                              [--install-cloudflared]
-#   fm-tunnel.sh down <project> [--zone <zone>]
-#   fm-tunnel.sh status <project> [--zone <zone>]
+#   fm-tunnel.sh down <project> [--hostname <host>] [--zone <zone>]
+#   fm-tunnel.sh status <project> [--hostname <host>] [--zone <zone>]
 #   fm-tunnel.sh --help
 #
 # Config precedence per setting (hostname/zone/service/emails), highest first:
@@ -18,10 +18,11 @@
 # <PROJECT> is <project> upper-cased with every non [A-Z0-9] character folded
 # to '_' (e.g. project "house-hunter" -> FM_TUNNEL_HOUSE_HUNTER_HOSTNAME).
 # Missing a required setting after all three is a hard error naming exactly
-# what to set. --hostname, --service, --emails and --install-cloudflared are
-# only valid for `up`. --zone is accepted by all three commands, so a project
-# provisioned with an ad-hoc --zone that was never written to cloudflare.env can
-# still be torn down or inspected by passing that same --zone.
+# what to set. --service, --emails and --install-cloudflared are creation-time
+# settings, only valid for `up`. --hostname and --zone are accepted by all three
+# commands, because they are what `down` and `status` look every resource up by:
+# a project provisioned with an ad-hoc --hostname/--zone that was never written
+# to cloudflare.env can still be torn down or inspected by passing them again.
 #
 # $FM_HOME/config/cloudflare.env (gitignored) also carries the account-wide
 # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID. See AGENTS.md for the
@@ -60,9 +61,11 @@
 # of an fm-tunnel-owned route is confirmed, never on the assumption that none was
 # created. A record that is not fm-tunnel's, or a zone that does not exist,
 # routes nothing to this tunnel, so fm-tunnel's own Access app is still removed
-# in those cases (the foreign record is reported untouched). When the zone is
-# simply not configured, re-run with `--zone <zone>` to finish the teardown. It
-# removes the local token file too. Safe to run on a partially-provisioned or
+# in those cases (the foreign record is reported untouched, and a nonexistent
+# zone is reported as an informational note rather than a survivor). When the
+# hostname or zone is simply not configured, re-run with `--hostname <host>`
+# and/or `--zone <zone>` to finish the teardown. It removes the local token
+# file too. Safe to run on a partially-provisioned or
 # already-torn-down project. It exits non-zero, with a summary of what survived,
 # if any lookup or delete failed - so a bad API token never reads as a
 # successful teardown.
@@ -88,8 +91,8 @@ trap 'cf_cleanup_tmp; exit 143' TERM
 usage() {
   cat >&2 <<'EOF'
 usage: fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] [--service <url>] [--emails <e1,e2,...>] [--install-cloudflared]
-       fm-tunnel.sh down <project> [--zone <zone>]
-       fm-tunnel.sh status <project> [--zone <zone>]
+       fm-tunnel.sh down <project> [--hostname <host>] [--zone <zone>]
+       fm-tunnel.sh status <project> [--hostname <host>] [--zone <zone>]
        fm-tunnel.sh --help
 EOF
 }
@@ -142,7 +145,6 @@ up_only() {
 while [ $# -gt 0 ]; do
   case "$1" in
     --hostname)
-      up_only "$1"
       [ $# -ge 2 ] || { echo "fm-tunnel: --hostname requires a value" >&2; exit 2; }
       CLI_HOSTNAME=$2; shift 2 ;;
     --zone)
@@ -402,7 +404,7 @@ case "$CMD" in
 
     APP_NAME=$(fm_tunnel_app_name "$PROJECT")
     DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
-    HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
+    HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "$CLI_HOSTNAME" 2>/dev/null || true)
     if [ -n "$HOSTNAME" ]; then
       # The DNS record goes first: it is the public route. The Access gate is
       # only removed once no fm-tunnel-owned route into this tunnel can still be
@@ -416,8 +418,10 @@ case "$CMD" in
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
+            # A zone that does not exist can hold no record, so there is no
+            # route of ours here and nothing survived.
             OUR_ROUTE_MAY_BE_LIVE=0
-            SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not found)")
+            echo "fm-tunnel: zone '$ZONE' not found - no DNS record for '$HOSTNAME' can exist in it" >&2
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -z "$DNS_ID" ]; then
               OUR_ROUTE_MAY_BE_LIVE=0
@@ -475,7 +479,7 @@ case "$CMD" in
         SURVIVORS+=("Access app for '$HOSTNAME' (lookup failed)")
       fi
     else
-      SURVIVORS+=("DNS record and Access app (no hostname configured to look them up by)")
+      SURVIVORS+=("DNS record and Access app (no hostname configured to look them up by; state unconfirmed - re-run: fm-tunnel.sh down $PROJECT --hostname <host> --zone <zone>)")
     fi
 
     if TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME"); then
@@ -503,7 +507,7 @@ case "$CMD" in
 
   status)
     TUNNEL_NAME="firstmate-$PROJECT"
-    HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
+    HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "$CLI_HOSTNAME" 2>/dev/null || true)
     # A failed lookup is reported as such: "not found" is reserved for a
     # Cloudflare query that actually succeeded and returned nothing, so status
     # stays trustworthy as a provisioning/teardown check.
@@ -551,9 +555,15 @@ case "$CMD" in
         echo "dns:         zone unknown (no --zone / FM_TUNNEL_*_ZONE configured)"
       fi
 
+      APP_NAME=$(fm_tunnel_app_name "$PROJECT")
       if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -z "$APP_ID" ]; then
           echo "access app:  not found"
+        elif ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
+          LOOKUP_FAILED=1
+          echo "access app:  $HOSTNAME ($APP_ID), read failed (see error above)"
+        elif [ "$CURRENT_APP_NAME" != "$APP_NAME" ]; then
+          echo "access app:  $HOSTNAME ($APP_ID) named '$CURRENT_APP_NAME' - not managed by fm-tunnel for '$PROJECT'"
         elif POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
           if [ -n "$POLICY_ID" ]; then
             echo "access app:  $HOSTNAME ($APP_ID), policy configured"
@@ -570,7 +580,7 @@ case "$CMD" in
       fi
     else
       LOOKUP_FAILED=1
-      echo "hostname:    not configured (no FM_TUNNEL_*_HOSTNAME) - skipping DNS/Access status"
+      echo "hostname:    not configured (pass --hostname or set FM_TUNNEL_*_HOSTNAME) - skipping DNS/Access status"
     fi
 
     if fm_tunnel_launchagent_loaded "$PROJECT"; then
