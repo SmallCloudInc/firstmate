@@ -12,4 +12,7 @@ config/backlog-backend
 config/backend
 config/x-mode.env
 config/spectrum-mode.env
+config/cloudflare.env
+config/tunnel-*.token
+config/tunnel-*-run.sh
 bin/spectrum-bridge/node_modules/

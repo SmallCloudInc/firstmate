@@ -47,6 +47,7 @@ This is.. a directory that turns any agent into your firstmate, and you the capt
 - **Optional secondmates** - opt in to persistent domain supervisors that run from isolated firstmate homes with their own `FM_HOME`, state, projects, and session lock, kept on the primary firstmate version by guarded local fast-forwards.
 - **Event-driven, zero-token supervision** - a bash watcher sleeps on the fleet and wakes the first mate only when something needs you.
 - **Optional X mode** - opt in with one local `.env` token so firstmate can answer your public `@myfirstmate` mentions, act on normal reversible mention requests through the same lifecycle as chat requests, acknowledge spawned work, and post one public-safe completion follow-up without changing non-X behavior; dry-run preview records would-be replies and dismissals locally before go-live.
+- **On-demand local tunnels** - `bin/fm-tunnel.sh up <project>` exposes a locally-running project on one of your own domains behind a Cloudflare Access login, provisioned entirely via the Cloudflare API with a firstmate-managed connector (see AGENTS.md section 15).
 - **Guarded by construction** - the first mate is read-only over your projects outside guarded clone refreshes, safe branch pruning, and approved `local-only` fast-forward merges; crewmates make every project change behind your merge approval.
 - **Restart-proof** - all state lives on disk and in the active session backend (tmux by hard default, herdr when selected or auto-detected); kill the session anytime and the next one reconciles and carries on.
 
@@ -149,7 +150,7 @@ Agent-only reference skills live under `.agents/skills/` and are loaded by first
 ## Documentation
 
 - [docs/architecture.md](docs/architecture.md) - how the crew, supervision, worktrees, secondmates, and project modes work.
-- [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, the files you set, and harness support.
+- [docs/configuration.md](docs/configuration.md) - environment variables, `FM_HOME`, runtime backend selection, optional X mode, optional local tunnels, the files you set, and harness support.
 - [docs/herdr-backend.md](docs/herdr-backend.md) - experimental herdr backend verification notes and known gaps.
 - [docs/spectrum-backend.md](docs/spectrum-backend.md) - opt-in private, always-on, two-way captain<->firstmate iMessage channel.
 - [docs/scripts.md](docs/scripts.md) - the `bin/` toolbelt reference.

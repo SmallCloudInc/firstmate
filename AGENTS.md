@@ -79,6 +79,9 @@ config/secondmate-harness  harness the PRIMARY uses to launch SECONDMATE agents,
 config/backlog-backend  backlog backend override; LOCAL, gitignored; absent or "tasks-axi" = default tasks-axi backend, "manual" = force hand-editing; inherited by secondmate homes (section 10)
 config/backend  runtime session-provider backend override for new tasks; LOCAL, gitignored; absent = falls through to runtime auto-detection (the runtime firstmate itself is executing inside), then tmux; tmux is the verified reference backend, herdr is a second, experimental backend (docs/herdr-backend.md); not inherited into secondmate homes
 config/x-mode.env    generated X-mode watcher cadence; LOCAL, gitignored; source before arming watcher when present
+config/cloudflare.env  Cloudflare credentials plus per-project tunnel settings; LOCAL, gitignored; presence-gates nothing, read only by bin/fm-tunnel.sh (section 15); see docs/examples/cloudflare.env
+config/tunnel-<project>.token  generated Cloudflare Tunnel run-token; LOCAL, gitignored, 0600; written and removed by fm-tunnel.sh, never printed (section 15)
+config/tunnel-<project>-run.sh  generated connector wrapper the LaunchAgent execs; LOCAL, gitignored; written and removed by fm-tunnel.sh (section 15)
 data/                personal fleet records; LOCAL, gitignored as a whole
   backlog.md         task queue, dependencies, history
   captain.md         captain's curated personal preferences and working style; LOCAL, gitignored, and canonical even if harness memory mirrors it
@@ -99,6 +102,7 @@ state/               volatile runtime signals; gitignored
   x-outbox/          generated X-mode dry-run reply and dismiss previews; inspect it when FMX_DRY_RUN is set (section 14)
   x-poll.error       generated X-mode relay diagnostic dedupe marker
   spectrum-poll.error   generated fm-spectrum bridge-error dedupe marker, mirroring x-poll.error
+  tunnel-<project>.out.log tunnel-<project>.err.log   connector stdout/stderr from the fm-tunnel LaunchAgent (section 15)
   .wake-queue        durable queued wakes: epoch<TAB>seq<TAB>kind<TAB>key<TAB>payload
   .afk               durable away-mode flag; present = sub-supervisor may inject escalations (set by /afk, cleared on user return)
   .watch.lock .wake-queue.lock watcher singleton and queue serialization locks
@@ -944,3 +948,37 @@ Truthy means anything except unset, empty, `0`, `false`, `no`, or `off`; an expl
 These dry-run paths run before token and network checks, so previewing a composed answer or dismiss needs `jq` but does not need `FMX_PAIRING_TOKEN`, `curl`, or a live relay.
 Polling and composing are unchanged, so the full poll -> wake -> compose -> would-post loop runs end to end without a public tweet - the mode for safe end-to-end testing.
 Inspect `state/x-outbox/` to see exactly what would have gone out.
+
+## 15. Local tunnels (Cloudflare)
+
+`bin/fm-tunnel.sh` exposes a locally-running project on the internet, on one of the captain's own domains, behind a Cloudflare Access email login gate - without opening a port. It provisions a remotely-managed ("token-run") Cloudflare Tunnel entirely through the Cloudflare API, then runs the local `cloudflared` connector as a firstmate-owned macOS LaunchAgent. This is a firstmate-repo capability, like every other `bin/` script: it never writes into `projects/`, and a project's own `cloudflared/` scaffolding (if any) is unrelated and untouched.
+
+**Config (gitignored, primary-only):** `$FM_HOME/config/cloudflare.env` carries the account-wide credentials plus one block of per-project settings:
+
+```sh
+CLOUDFLARE_API_TOKEN=<scoped API token>
+CLOUDFLARE_ACCOUNT_ID=<Cloudflare account id>
+
+FM_TUNNEL_HOUSEHUNTER_HOSTNAME=househunter.example.com
+FM_TUNNEL_HOUSEHUNTER_ZONE=example.com
+FM_TUNNEL_HOUSEHUNTER_SERVICE=http://localhost:8765
+FM_TUNNEL_HOUSEHUNTER_ACCESS_EMAILS=captain@example.com
+```
+
+The per-project key prefix is `FM_TUNNEL_<PROJECT>_`, where `<PROJECT>` is the project id passed on the command line, upper-cased with every character outside `[A-Z0-9]` folded to `_` (e.g. `house-hunter` -> `FM_TUNNEL_HOUSE_HUNTER_HOSTNAME`). `ACCESS_EMAILS` is a comma-separated allow list for the Cloudflare Access One-Time-PIN login. Each of `hostname`/`zone`/`service`/`emails` resolves by precedence: an explicit `--hostname`/`--zone`/`--service`/`--emails` flag, then a same-named real process environment variable, then the config file; a setting missing after all three is a hard error naming exactly what to set. See [`docs/examples/cloudflare.env`](docs/examples/cloudflare.env) for a documented starting point to copy into local `config/cloudflare.env`.
+
+**Required Cloudflare API token scopes** (account-scoped, SmallCloudInc account): Account - Cloudflare Tunnel:Edit, Zone - DNS:Edit, Account - Access: Apps and Policies:Edit, plus the paired Read permissions Cloudflare requires alongside each Edit scope, and Account - Zone:Read / Zone - Zone:Read for zone lookup.
+
+**Usage:**
+
+```sh
+bin/fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] [--service <url>] [--emails <e1,e2,...>] [--install-cloudflared]
+bin/fm-tunnel.sh down <project> [--hostname <host>] [--zone <zone>]
+bin/fm-tunnel.sh status <project> [--hostname <host>] [--zone <zone>]
+```
+
+`--service`, `--emails`, and `--install-cloudflared` are creation-time settings, only valid for `up`; `down` and `status` reject them rather than silently ignoring them. `--hostname` and `--zone` are accepted by all three commands through the same precedence, because they are what `down` and `status` look every resource up by: a project provisioned with an ad-hoc `--hostname`/`--zone` that was never written to `config/cloudflare.env` can still be torn down or inspected by passing them again.
+
+`up` is idempotent and safe to re-run: every Cloudflare resource (the tunnel named `firstmate-<project>`, the DNS record, the Access app, and its `firstmate-tunnel-access` policy) is found by name/hostname before it is created, so re-running updates in place rather than duplicating. Every resource fm-tunnel creates carries an ownership marker - the DNS record's `comment` is `managed by firstmate fm-tunnel: <project>`, and the Access app's name is `firstmate: <project>` - and neither `up` nor `down` will update or delete a pre-existing resource found at that hostname unless it carries this project's marker, so a typo'd or stale `--hostname` can never silently repoint or delete an unrelated production DNS record or Access app. It provisions in order - tunnel, ingress config, Access app, Access allow-policy, DNS CNAME to `<tunnel-id>.cfargotunnel.com`, run-token, LaunchAgent - so a public route into the tunnel never exists before the login gate that fronts it, and on a failure at any step reports exactly what was and wasn't created so nothing is left half-provisioned silently. The hostname's DNS ownership marker is checked by a read-only lookup before the Access app is created, so an `up` against a hostname held by an unrelated record aborts without ever putting a login gate in front of it. A firstmate-owned DNS record is rewritten on every `up` rather than skipped when its target already matches, so a record whose `proxied` flag was flipped off (which would bypass Access entirely) is self-healed. The run-token is stored gitignored at `$FM_HOME/config/tunnel-<project>.token` (0600) and is never printed to stdout/stderr/logs; the LaunchAgent (label `com.firstmate.tunnel.<project>`) execs a small wrapper script that reads the token file and runs `cloudflared tunnel run` with the token passed through the `TUNNEL_TOKEN` environment variable rather than argv (so it is not exposed via `ps`), through the absolute `cloudflared` path resolved at `up` time, because launchd's minimal PATH covers neither Homebrew prefix. The connector's stdout and stderr land in `$FM_HOME/state/tunnel-<project>.out.log` and `.err.log`. A re-run whose token file, wrapper, and plist are already byte-identical to what it would write, with a live connector pid, is a true no-op: the LaunchAgent is left alone rather than bounced, so an idempotent `up` never drops a live tunnel. The `cloudflared` and `launchctl` availability check runs before the first Cloudflare API call, so a host missing either tool fails with zero cloud resources created. A missing `cloudflared` is a hard error naming the `brew install cloudflared` command, mirroring bootstrap's MISSING:/consent/install convention (section 3) - `up` installs it via Homebrew only when the captain passes the explicit `--install-cloudflared` opt-in. `down` stops the LaunchAgent and verifies it is actually no longer running before removing the plist, wrapper, and token file, then deletes the DNS record, the Access policy and its Access app, and the tunnel (in that order, so the public route is removed first and a partial failure can never leave the hostname resolvable with its login gate already gone). The Access app and policy are deleted only once an unambiguous Cloudflare read has confirmed that no fm-tunnel-owned route survives at the hostname: the record was deleted, the lookup succeeded and found none, or the record found there is foreign (it routes nothing to this tunnel, and is reported untouched). Every other outcome leaves the record's state unconfirmed - a zone or record lookup failure, an empty zone list (an under-scoped API token sees no zone, so an invisible zone is never read as a nonexistent one), a record read failure, a failed delete, or no hostname/zone configured to look the record up by, in which case it says to re-run with `--hostname <host>` and/or `--zone <zone>` - and the Access app and policy are then deliberately left alive and reported as survivors; the gate is only ever removed once the absence of an fm-tunnel-owned route is confirmed, never on an assumption that none was created. It is safe to run against a partially-provisioned or already-torn-down project, and exits non-zero listing what may still be live if the connector could not be stopped or any lookup or delete failed, so a bad token never reads as a successful teardown. `status` reports what currently exists without changing anything, distinguishing a genuine "not found" from a "lookup failed" and exiting non-zero whenever it cannot confirm the DNS record's actual state (including a zone the API token cannot see, an unresolvable zone, and an unconfigured hostname); it reports a DNS record or an Access app found at the hostname as fm-tunnel's only when it carries this project's ownership marker (the record's `comment`, the app's name), labelling anything else as unmanaged, and calls the connector running only when launchd reports a live pid for it.
+
+The connector is managed entirely from firstmate's side (`$FM_HOME/config/` and a LaunchAgent), never from inside a project's worktree - consistent with the hard rule that firstmate never writes to `projects/` (section 1).

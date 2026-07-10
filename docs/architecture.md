@@ -171,6 +171,17 @@ Because every inbound record is bridge-verified against the sender allowlist bef
 For preview testing, `SPECTRUM_DRY_RUN` makes outbound sends record their would-be payload under `state/spectrum-outbox/` (with `dry_run: true`) instead of reaching a live account, while the rest of the loop still succeeds.
 The watcher, wake queue, arm wrapper, and afk daemon are unchanged; fm-spectrum is layered on top through the same check mechanism X mode uses. Full detail lives in [docs/spectrum-backend.md](spectrum-backend.md).
 
+## Optional local tunnels (fm-tunnel)
+
+`bin/fm-tunnel.sh` puts a locally-running project on one of the captain's own domains behind a Cloudflare Access email login gate, without opening a port.
+It is inert until the firstmate home's gitignored `config/cloudflare.env` carries Cloudflare credentials and a `FM_TUNNEL_<PROJECT>_` settings block, so a user who never configures it sees no behavior change.
+Provisioning is pure Cloudflare API: a remotely-managed ("token-run") tunnel, its ingress, an Access app and allow-policy, and a DNS CNAME to `<tunnel-id>.cfargotunnel.com`, created in exactly that order so a public route never exists before the login gate that fronts it.
+`up` is idempotent - every resource is found by name or hostname before it is created - and every resource firstmate creates carries an ownership marker, so a typo'd hostname aborts rather than repointing or deleting an unrelated production record or Access app.
+Teardown reverses the order and removes the gate only once an unambiguous Cloudflare read confirms no fm-tunnel-owned route survives; any unconfirmed lookup leaves the gate alive and reports it as a survivor rather than assuming absence.
+The local connector is a firstmate-owned macOS LaunchAgent whose run-token lives 0600 in `config/`, passed to `cloudflared` through the environment rather than argv, so nothing is ever written into `projects/` and the token never reaches argv, stdout, or a log.
+This is a firstmate-side capability like every other `bin/` script: the supervision loop, watcher, and task lifecycle are untouched by it.
+Full detail lives in [AGENTS.md section 15](../AGENTS.md#15-local-tunnels-cloudflare).
+
 ## Project memory belongs to projects
 
 Durable project-intrinsic agent knowledge lives in each project's committed `AGENTS.md`, with `CLAUDE.md` as a symlink.
