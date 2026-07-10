@@ -944,3 +944,35 @@ Truthy means anything except unset, empty, `0`, `false`, `no`, or `off`; an expl
 These dry-run paths run before token and network checks, so previewing a composed answer or dismiss needs `jq` but does not need `FMX_PAIRING_TOKEN`, `curl`, or a live relay.
 Polling and composing are unchanged, so the full poll -> wake -> compose -> would-post loop runs end to end without a public tweet - the mode for safe end-to-end testing.
 Inspect `state/x-outbox/` to see exactly what would have gone out.
+
+## 15. Local tunnels (Cloudflare)
+
+`bin/fm-tunnel.sh` exposes a locally-running project on the internet, on one of the captain's own domains, behind a Cloudflare Access email login gate - without opening a port. It provisions a remotely-managed ("token-run") Cloudflare Tunnel entirely through the Cloudflare API, then runs the local `cloudflared` connector as a firstmate-owned macOS LaunchAgent. This is a firstmate-repo capability, like every other `bin/` script: it never writes into `projects/`, and a project's own `cloudflared/` scaffolding (if any) is unrelated and untouched.
+
+**Config (gitignored, primary-only):** `$FM_HOME/config/cloudflare.env` carries the account-wide credentials plus one block of per-project settings:
+
+```sh
+CLOUDFLARE_API_TOKEN=<scoped API token>
+CLOUDFLARE_ACCOUNT_ID=<Cloudflare account id>
+
+FM_TUNNEL_HOUSEHUNTER_HOSTNAME=househunter.example.com
+FM_TUNNEL_HOUSEHUNTER_ZONE=example.com
+FM_TUNNEL_HOUSEHUNTER_SERVICE=http://localhost:8765
+FM_TUNNEL_HOUSEHUNTER_ACCESS_EMAILS=captain@example.com
+```
+
+The per-project key prefix is `FM_TUNNEL_<PROJECT>_`, where `<PROJECT>` is the project id passed on the command line, upper-cased with every character outside `[A-Z0-9]` folded to `_` (e.g. `house-hunter` -> `FM_TUNNEL_HOUSE_HUNTER_HOSTNAME`). `ACCESS_EMAILS` is a comma-separated allow list for the Cloudflare Access One-Time-PIN login. Each of `hostname`/`zone`/`service`/`emails` resolves by precedence: an explicit `--hostname`/`--zone`/`--service`/`--emails` flag, then a same-named real process environment variable, then the config file; a setting missing after all three is a hard error naming exactly what to set.
+
+**Required Cloudflare API token scopes** (account-scoped, SmallCloudInc account): Account - Cloudflare Tunnel:Edit, Zone - DNS:Edit, Account - Access: Apps and Policies:Edit, plus the paired Read permissions Cloudflare requires alongside each Edit scope, and Account - Zone:Read / Zone - Zone:Read for zone lookup.
+
+**Usage:**
+
+```sh
+bin/fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] [--service <url>] [--emails <e1,e2,...>]
+bin/fm-tunnel.sh down <project>
+bin/fm-tunnel.sh status <project>
+```
+
+`up` is idempotent and safe to re-run: every Cloudflare resource (tunnel, DNS record, Access app, Access policy) is found by name/hostname before it is created, so re-running updates in place rather than duplicating. It provisions in order - tunnel, ingress config, DNS CNAME to `<tunnel-id>.cfargotunnel.com`, Access app, Access allow-policy, run-token, LaunchAgent - and on a failure at any step reports exactly what was and wasn't created so nothing is left half-provisioned silently. The run-token is stored gitignored at `$FM_HOME/config/tunnel-<project>.token` (0600) and is never printed to stdout/stderr/logs; the LaunchAgent (label `com.firstmate.tunnel.<project>`) execs a small wrapper script that reads the token file and runs `cloudflared tunnel run --token ...`, installing `cloudflared` via Homebrew first if it's missing. `down` stops the LaunchAgent, then deletes the Access policy, Access app, DNS record, and tunnel (in that order), and removes the local token file; it is safe to run against a partially-provisioned or already-torn-down project. `status` reports what currently exists without changing anything.
+
+The connector is managed entirely from firstmate's side (`$FM_HOME/config/` and a LaunchAgent), never from inside a project's worktree - consistent with the hard rule that firstmate never writes to `projects/` (section 1).

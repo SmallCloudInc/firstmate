@@ -1,0 +1,554 @@
+#!/usr/bin/env bash
+# fm-tunnel-lib.sh - shared helpers for fm-tunnel.sh: Cloudflare API client,
+# config resolution, and the resource-level find/create/update primitives for
+# a remotely-managed ("token-run") Cloudflare Tunnel behind Cloudflare Access.
+#
+# This file is sourced, never executed. It never prints CLOUDFLARE_API_TOKEN or
+# a tunnel run-token to stdout/stderr/logs. JSON is built and parsed with
+# python3 (argv-passed values only, never interpolated into python source) so
+# hostnames/emails/tokens with shell-special characters stay safe.
+#
+# Callers must set FM_HOME before sourcing fm_tunnel_load_config, and must have
+# curl and python3 on PATH (checked by fm-tunnel.sh's own preflight).
+set -u
+
+CF_API_BASE="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
+
+# --- temp file bookkeeping ---------------------------------------------------
+
+CF_TMP_FILES=()
+
+cf_mktemp() {
+  local f
+  f=$(mktemp "${TMPDIR:-/tmp}/fm-tunnel.XXXXXX") || return 1
+  CF_TMP_FILES+=("$f")
+  printf '%s\n' "$f"
+}
+
+cf_cleanup_tmp() {
+  if [ "${#CF_TMP_FILES[@]}" -gt 0 ]; then
+    rm -f "${CF_TMP_FILES[@]}"
+  fi
+}
+
+# --- config resolution --------------------------------------------------------
+
+# fm_tunnel_env_get <key> <file>: read the last KEY=VALUE assignment from a
+# .env-style file (tolerates "export ", surrounding whitespace, one layer of
+# quoting). Prints nothing (and succeeds) when the file or key is absent.
+fm_tunnel_env_get() {
+  local key=$1 file=$2 line val
+  [ -f "$file" ] || return 0
+  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n1) || return 0
+  [ -n "$line" ] || return 0
+  val=${line#*=}
+  val=${val#"${val%%[![:space:]]*}"}
+  val=${val%"${val##*[![:space:]]}"}
+  case "$val" in
+    \"*\") val=${val#\"}; val=${val%\"} ;;
+    \'*\') val=${val#\'}; val=${val%\'} ;;
+  esac
+  printf '%s' "$val"
+}
+
+# fm_tunnel_project_var <project> <suffix>: normalize a project id into the
+# FM_TUNNEL_<PROJECT>_<SUFFIX> config-file key, e.g. "house-hunter" HOSTNAME ->
+# FM_TUNNEL_HOUSE_HUNTER_HOSTNAME.
+fm_tunnel_project_var() {
+  local project=$1 suffix=$2 norm
+  norm=$(printf '%s' "$project" | tr '[:lower:]' '[:upper:]' | LC_ALL=C sed -E 's/[^A-Z0-9]/_/g')
+  printf 'FM_TUNNEL_%s_%s' "$norm" "$suffix"
+}
+
+# fm_tunnel_load_config: read CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID from
+# $FM_HOME/config/cloudflare.env into CF_TOKEN / CF_ACCOUNT_ID. An explicit
+# process environment variable always wins over the file. Prints nothing;
+# callers check whether CF_TOKEN/CF_ACCOUNT_ID ended up non-empty.
+fm_tunnel_load_config() {
+  local env_file="${FM_TUNNEL_CONFIG_FILE:-$FM_HOME/config/cloudflare.env}"
+  FM_TUNNEL_CONFIG_FILE_RESOLVED=$env_file
+  if [ -n "${CLOUDFLARE_API_TOKEN+x}" ]; then
+    CF_TOKEN=${CLOUDFLARE_API_TOKEN-}
+  else
+    CF_TOKEN=$(fm_tunnel_env_get CLOUDFLARE_API_TOKEN "$env_file")
+  fi
+  if [ -n "${CLOUDFLARE_ACCOUNT_ID+x}" ]; then
+    CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID-}
+  else
+    CF_ACCOUNT_ID=$(fm_tunnel_env_get CLOUDFLARE_ACCOUNT_ID "$env_file")
+  fi
+}
+
+# fm_tunnel_resolve <project> <suffix> <cli-value>: resolve one project setting
+# (hostname/zone/service/emails) by precedence: explicit CLI flag > real
+# process env var of the same FM_TUNNEL_<PROJECT>_<SUFFIX> name > the config
+# file. Prints the resolved value, or nothing when unresolved.
+fm_tunnel_resolve() {
+  local project=$1 suffix=$2 cli_value=$3 varname
+  if [ -n "$cli_value" ]; then
+    printf '%s' "$cli_value"
+    return 0
+  fi
+  varname=$(fm_tunnel_project_var "$project" "$suffix")
+  local envval
+  envval=$(eval "printf '%s' \"\${$varname-}\"")
+  if [ -n "$envval" ]; then
+    printf '%s' "$envval"
+    return 0
+  fi
+  fm_tunnel_env_get "$varname" "$FM_TUNNEL_CONFIG_FILE_RESOLVED"
+}
+
+# --- Cloudflare API client -----------------------------------------------------
+
+# cf_auth_header_file: write "Authorization: Bearer <token>" to a 0600 temp
+# file so the token never appears in curl's argv (visible via ps/history).
+cf_auth_header_file() {
+  local file
+  case "$CF_TOKEN" in
+    *$'\n'*|*$'\r'*) return 1 ;;
+  esac
+  file=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-tunnel-auth.XXXXXX") || return 1
+  chmod 600 "$file" 2>/dev/null || { rm -f "$file"; return 1; }
+  printf 'Authorization: Bearer %s\n' "$CF_TOKEN" > "$file" || { rm -f "$file"; return 1; }
+  printf '%s\n' "$file"
+}
+
+cf_urlencode() {
+  python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+# cf_request <METHOD> <path-and-query> [json-body]: call the Cloudflare API.
+# Sets CF_HTTP_CODE (string) and CF_BODY_FILE (path to the raw JSON response,
+# valid until the next cf_request call or process exit). Returns non-zero only
+# on a transport failure (curl missing, network error); HTTP error codes are
+# still captured in CF_HTTP_CODE for the caller to check with cf_check_ok.
+cf_request() {
+  local method=$1 path=$2 body=${3:-}
+  command -v curl >/dev/null 2>&1 || { echo "fm-tunnel: curl not found" >&2; return 1; }
+  local auth_file body_file req_file=
+  auth_file=$(cf_auth_header_file) || { echo "fm-tunnel: cannot prepare auth header" >&2; return 1; }
+  body_file=$(cf_mktemp) || { rm -f "$auth_file"; return 1; }
+  CF_BODY_FILE=$body_file
+  local rc
+  if [ -n "$body" ]; then
+    req_file=$(cf_mktemp) || { rm -f "$auth_file"; return 1; }
+    printf '%s' "$body" > "$req_file"
+    CF_HTTP_CODE=$(curl -sS -m 20 -o "$body_file" -w '%{http_code}' -X "$method" \
+      -H "@$auth_file" -H 'Content-Type: application/json' \
+      --data-binary "@$req_file" "${CF_API_BASE}${path}" 2>/dev/null)
+    rc=$?
+  else
+    CF_HTTP_CODE=$(curl -sS -m 20 -o "$body_file" -w '%{http_code}' -X "$method" \
+      -H "@$auth_file" -H 'Content-Type: application/json' \
+      "${CF_API_BASE}${path}" 2>/dev/null)
+    rc=$?
+  fi
+  rm -f "$auth_file"
+  if [ "$rc" -ne 0 ]; then
+    echo "fm-tunnel: request to Cloudflare API failed (network error)" >&2
+    return 1
+  fi
+  return 0
+}
+
+# cf_error_message <body-file>: join Cloudflare's "errors[].message" entries
+# into one string, or print nothing if the body has no errors array.
+cf_error_message() {
+  local file=$1
+  python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(0)
+errs = d.get("errors") if isinstance(d, dict) else None
+if errs:
+    msgs = [str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in errs]
+    print("; ".join(msgs))
+' "$file" 2>/dev/null
+}
+
+# cf_check_ok <context-label>: verify the last cf_request succeeded (2xx).
+# Prints an actionable error (including Cloudflare's own message) on failure.
+cf_check_ok() {
+  case "$CF_HTTP_CODE" in
+    2[0-9][0-9]) return 0 ;;
+    *)
+      local msg
+      msg=$(cf_error_message "$CF_BODY_FILE")
+      echo "fm-tunnel: $1 failed (HTTP ${CF_HTTP_CODE:-?})${msg:+: $msg}" >&2
+      return 1
+      ;;
+  esac
+}
+
+cf_extract() {
+  # cf_extract <body-file> <python-expr-of-loaded-json-'d'>
+  local file=$1 expr=$2
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+expr = sys.argv[2]
+result = eval(expr, {"__builtins__": {}}, {"d": d})
+if result is None:
+    pass
+elif isinstance(result, (dict, list)):
+    print(json.dumps(result))
+else:
+    print(result)
+' "$file" "$expr" 2>/dev/null
+}
+
+# --- request body builders (argv-only, never interpolated into python source) -
+
+cf_body_tunnel_create() {
+  python3 -c 'import json,sys; print(json.dumps({"name": sys.argv[1], "config_src": "cloudflare"}))' "$1"
+}
+
+cf_body_tunnel_ingress() {
+  python3 -c '
+import json, sys
+hostname, service = sys.argv[1], sys.argv[2]
+cfg = {"ingress": [{"hostname": hostname, "service": service}, {"service": "http_status:404"}]}
+print(json.dumps({"config": cfg}))
+' "$1" "$2"
+}
+
+cf_body_dns_record() {
+  python3 -c '
+import json, sys
+hostname, content = sys.argv[1], sys.argv[2]
+print(json.dumps({"name": hostname, "type": "CNAME", "content": content, "proxied": True, "ttl": 1}))
+' "$1" "$2"
+}
+
+cf_body_access_app() {
+  python3 -c '
+import json, sys
+hostname, name = sys.argv[1], sys.argv[2]
+print(json.dumps({"type": "self_hosted", "domain": hostname, "name": name, "session_duration": "24h"}))
+' "$1" "$2"
+}
+
+# cf_body_access_policy <name> <email> [<email> ...]
+cf_body_access_policy() {
+  local name=$1
+  shift
+  python3 -c '
+import json, sys
+name = sys.argv[1]
+emails = sys.argv[2:]
+include = [{"email": {"email": e}} for e in emails]
+print(json.dumps({"name": name, "decision": "allow", "include": include, "precedence": 1}))
+' "$name" "$@"
+}
+
+# --- resource-level find/create/update helpers ---------------------------------
+
+FM_TUNNEL_ACCESS_POLICY_NAME="firstmate-tunnel-access"
+
+# cf_tunnel_find <name>: print the id of a non-deleted tunnel with an exact
+# name match, or nothing if none exists.
+cf_tunnel_find() {
+  local name=$1 enc
+  enc=$(cf_urlencode "$name")
+  cf_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$enc&is_deleted=false" || return 2
+  cf_check_ok "list tunnels" || return 1
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+name = sys.argv[2]
+for t in (d.get("result") or []):
+    if t.get("name") == name and not t.get("deleted_at"):
+        print(t.get("id",""))
+        break
+' "$CF_BODY_FILE" "$name"
+}
+
+# cf_tunnel_create <name>: create a remotely-managed tunnel, print its id.
+cf_tunnel_create() {
+  local name=$1 body
+  body=$(cf_body_tunnel_create "$name")
+  cf_request POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" "$body" || return 2
+  cf_check_ok "create tunnel '$name'" || return 1
+  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+}
+
+# cf_tunnel_set_ingress <tunnel_id> <hostname> <service>: set the tunnel's
+# remote ingress config (idempotent: PUT always sets the full config).
+cf_tunnel_set_ingress() {
+  local id=$1 hostname=$2 service=$3 body
+  body=$(cf_body_tunnel_ingress "$hostname" "$service")
+  cf_request PUT "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/configurations" "$body" || return 2
+  cf_check_ok "set ingress for tunnel $id"
+}
+
+# cf_tunnel_token <tunnel_id>: print the connector run-token (never log this).
+cf_tunnel_token() {
+  local id=$1
+  cf_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/token" || return 2
+  cf_check_ok "fetch run-token for tunnel $id" || return 1
+  cf_extract "$CF_BODY_FILE" 'd.get("result","")'
+}
+
+# cf_tunnel_delete <tunnel_id>
+cf_tunnel_delete() {
+  local id=$1
+  cf_request DELETE "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id" || return 2
+  cf_check_ok "delete tunnel $id"
+}
+
+# cf_zone_id <zone-name>: print the zone id, or nothing if not found.
+cf_zone_id() {
+  local zone=$1 enc
+  enc=$(cf_urlencode "$zone")
+  cf_request GET "/zones?name=$enc" || return 2
+  cf_check_ok "look up zone '$zone'" || return 1
+  cf_extract "$CF_BODY_FILE" '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
+}
+
+# cf_dns_find <zone_id> <hostname>: print the CNAME record id, or nothing.
+cf_dns_find() {
+  local zone_id=$1 hostname=$2 enc
+  enc=$(cf_urlencode "$hostname")
+  cf_request GET "/zones/$zone_id/dns_records?type=CNAME&name=$enc" || return 2
+  cf_check_ok "look up DNS record for '$hostname'" || return 1
+  cf_extract "$CF_BODY_FILE" '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
+}
+
+# cf_dns_current_content <zone_id> <record_id>: print the record's current
+# content (target), used to decide whether an update is actually needed.
+cf_dns_current_content() {
+  local zone_id=$1 record_id=$2
+  cf_request GET "/zones/$zone_id/dns_records/$record_id" || return 2
+  cf_check_ok "read DNS record $record_id" || return 1
+  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("content","")'
+}
+
+# cf_dns_create <zone_id> <hostname> <content>: create the proxied CNAME.
+cf_dns_create() {
+  local zone_id=$1 hostname=$2 content=$3 body
+  body=$(cf_body_dns_record "$hostname" "$content")
+  cf_request POST "/zones/$zone_id/dns_records" "$body" || return 2
+  cf_check_ok "create DNS record for '$hostname'" || return 1
+  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+}
+
+# cf_dns_update <zone_id> <record_id> <hostname> <content>
+cf_dns_update() {
+  local zone_id=$1 record_id=$2 hostname=$3 content=$4 body
+  body=$(cf_body_dns_record "$hostname" "$content")
+  cf_request PUT "/zones/$zone_id/dns_records/$record_id" "$body" || return 2
+  cf_check_ok "update DNS record for '$hostname'"
+}
+
+# cf_dns_delete <zone_id> <record_id>
+cf_dns_delete() {
+  local zone_id=$1 record_id=$2
+  cf_request DELETE "/zones/$zone_id/dns_records/$record_id" || return 2
+  cf_check_ok "delete DNS record $record_id"
+}
+
+# cf_access_app_find <hostname>: print the app id for an exact domain match.
+cf_access_app_find() {
+  local hostname=$1 enc
+  enc=$(cf_urlencode "$hostname")
+  cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps?domain=$enc" || return 2
+  cf_check_ok "list Access apps for '$hostname'" || return 1
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+hostname = sys.argv[2]
+for a in (d.get("result") or []):
+    if a.get("domain") == hostname:
+        print(a.get("id",""))
+        break
+' "$CF_BODY_FILE" "$hostname"
+}
+
+# cf_access_app_create <hostname> <name>: create the self-hosted app, print id.
+cf_access_app_create() {
+  local hostname=$1 name=$2 body
+  body=$(cf_body_access_app "$hostname" "$name")
+  cf_request POST "/accounts/$CF_ACCOUNT_ID/access/apps" "$body" || return 2
+  cf_check_ok "create Access app for '$hostname'" || return 1
+  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+}
+
+# cf_access_app_update <app_id> <hostname> <name>
+cf_access_app_update() {
+  local app_id=$1 hostname=$2 name=$3 body
+  body=$(cf_body_access_app "$hostname" "$name")
+  cf_request PUT "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id" "$body" || return 2
+  cf_check_ok "update Access app $app_id"
+}
+
+# cf_access_app_delete <app_id>
+cf_access_app_delete() {
+  local app_id=$1
+  cf_request DELETE "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id" || return 2
+  cf_check_ok "delete Access app $app_id"
+}
+
+# cf_access_policy_find <app_id>: print the id of the firstmate-managed policy
+# (matched by name), or nothing.
+cf_access_policy_find() {
+  local app_id=$1
+  cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" || return 2
+  cf_check_ok "list Access policies for app $app_id" || return 1
+  python3 -c '
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+name = sys.argv[2]
+for p in (d.get("result") or []):
+    if p.get("name") == name:
+        print(p.get("id",""))
+        break
+' "$CF_BODY_FILE" "$FM_TUNNEL_ACCESS_POLICY_NAME"
+}
+
+# cf_access_policy_create <app_id> <email> [<email> ...]: print the policy id.
+cf_access_policy_create() {
+  local app_id=$1
+  shift
+  local body
+  body=$(cf_body_access_policy "$FM_TUNNEL_ACCESS_POLICY_NAME" "$@")
+  cf_request POST "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" "$body" || return 2
+  cf_check_ok "create Access policy for app $app_id" || return 1
+  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+}
+
+# cf_access_policy_update <app_id> <policy_id> <email> [<email> ...]
+cf_access_policy_update() {
+  local app_id=$1 policy_id=$2
+  shift 2
+  local body
+  body=$(cf_body_access_policy "$FM_TUNNEL_ACCESS_POLICY_NAME" "$@")
+  cf_request PUT "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies/$policy_id" "$body" || return 2
+  cf_check_ok "update Access policy $policy_id"
+}
+
+# cf_access_policy_delete <app_id> <policy_id>
+cf_access_policy_delete() {
+  local app_id=$1 policy_id=$2
+  cf_request DELETE "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies/$policy_id" || return 2
+  cf_check_ok "delete Access policy $policy_id"
+}
+
+# --- connector (LaunchAgent) management ----------------------------------------
+
+fm_tunnel_label() {
+  printf 'com.firstmate.tunnel.%s' "$1"
+}
+
+fm_tunnel_plist_path() {
+  printf '%s/Library/LaunchAgents/%s.plist' "${FM_TUNNEL_HOME_DIR:-$HOME}" "$(fm_tunnel_label "$1")"
+}
+
+fm_tunnel_token_path() {
+  printf '%s/config/tunnel-%s.token' "$FM_HOME" "$1"
+}
+
+fm_tunnel_wrapper_path() {
+  printf '%s/config/tunnel-%s-run.sh' "$FM_HOME" "$1"
+}
+
+fm_tunnel_log_path() {
+  printf '%s/state/tunnel-%s.%s.log' "$FM_HOME" "$1" "$2"
+}
+
+fm_tunnel_ensure_cloudflared() {
+  command -v cloudflared >/dev/null 2>&1 && return 0
+  command -v brew >/dev/null 2>&1 || {
+    echo "fm-tunnel: cloudflared not found and Homebrew is unavailable to install it" >&2
+    return 1
+  }
+  echo "fm-tunnel: installing cloudflared via Homebrew" >&2
+  brew install cloudflared >&2
+}
+
+# fm_tunnel_write_wrapper <project>: write the small script the LaunchAgent
+# execs. Keeping the token out of the plist means it never lands in a
+# world-readable file under ~/Library/LaunchAgents (still visible in `ps` while
+# cloudflared runs, which is unavoidable with the token-run model).
+fm_tunnel_write_wrapper() {
+  local project=$1 wrapper token_file
+  wrapper=$(fm_tunnel_wrapper_path "$project")
+  token_file=$(fm_tunnel_token_path "$project")
+  mkdir -p "$(dirname "$wrapper")" || return 1
+  cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec cloudflared tunnel run --token "\$(cat "$token_file")"
+EOF
+  chmod 700 "$wrapper"
+}
+
+# fm_tunnel_write_plist <project>: write the LaunchAgent plist.
+fm_tunnel_write_plist() {
+  local project=$1 plist label wrapper out_log err_log
+  plist=$(fm_tunnel_plist_path "$project")
+  label=$(fm_tunnel_label "$project")
+  wrapper=$(fm_tunnel_wrapper_path "$project")
+  out_log=$(fm_tunnel_log_path "$project" out)
+  err_log=$(fm_tunnel_log_path "$project" err)
+  mkdir -p "$(dirname "$plist")" "$(dirname "$out_log")" || return 1
+  cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${wrapper}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${out_log}</string>
+  <key>StandardErrorPath</key>
+  <string>${err_log}</string>
+</dict>
+</plist>
+EOF
+}
+
+# fm_tunnel_launchagent_start <project>: (re)load the LaunchAgent so it picks
+# up a fresh plist/token. Idempotent: unload is best-effort (a fresh install
+# has nothing loaded yet).
+fm_tunnel_launchagent_start() {
+  local project=$1 plist
+  plist=$(fm_tunnel_plist_path "$project")
+  command -v launchctl >/dev/null 2>&1 || { echo "fm-tunnel: launchctl not found" >&2; return 1; }
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+  launchctl load -w "$plist"
+}
+
+# fm_tunnel_launchagent_stop <project>: unload if loaded; never errors on an
+# already-stopped agent.
+fm_tunnel_launchagent_stop() {
+  local project=$1 plist
+  plist=$(fm_tunnel_plist_path "$project")
+  command -v launchctl >/dev/null 2>&1 || return 0
+  [ -f "$plist" ] || return 0
+  launchctl unload "$plist" >/dev/null 2>&1 || true
+}
+
+# fm_tunnel_launchagent_alive <project>: succeed if launchctl currently lists
+# the label (i.e. the agent is loaded, whether or not the process is up).
+fm_tunnel_launchagent_alive() {
+  local project=$1 label
+  label=$(fm_tunnel_label "$project")
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl list 2>/dev/null | grep -qF "$label"
+}
