@@ -130,6 +130,13 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+for tool in curl python3; do
+  command -v "$tool" >/dev/null 2>&1 || {
+    echo "fm-tunnel: $tool not found on PATH (required for Cloudflare API calls)" >&2
+    exit 1
+  }
+done
+
 fm_tunnel_load_config
 if [ -z "$CF_TOKEN" ]; then
   echo "fm-tunnel: no CLOUDFLARE_API_TOKEN (set it in $FM_TUNNEL_CONFIG_FILE_RESOLVED or the environment)" >&2
@@ -280,14 +287,20 @@ case "$CMD" in
     if [ -n "$HOSTNAME" ]; then
       if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -n "$APP_ID" ]; then
+          # Deleting the Access app removes its policies with it, so a policy
+          # problem only survives when the app delete also fails.
+          POLICY_SURVIVOR=""
           if POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
             if [ -n "$POLICY_ID" ]; then
-              cf_access_policy_delete "$APP_ID" "$POLICY_ID" || SURVIVORS+=("Access policy $POLICY_ID (delete failed)")
+              cf_access_policy_delete "$APP_ID" "$POLICY_ID" || POLICY_SURVIVOR="Access policy $POLICY_ID (delete failed)"
             fi
           else
-            SURVIVORS+=("Access policy for app $APP_ID (lookup failed)")
+            POLICY_SURVIVOR="Access policy for app $APP_ID (lookup failed)"
           fi
-          cf_access_app_delete "$APP_ID" || SURVIVORS+=("Access app $APP_ID (delete failed)")
+          if ! cf_access_app_delete "$APP_ID"; then
+            SURVIVORS+=("Access app $APP_ID (delete failed)")
+            [ -n "$POLICY_SURVIVOR" ] && SURVIVORS+=("$POLICY_SURVIVOR")
+          fi
         fi
       else
         SURVIVORS+=("Access app for '$HOSTNAME' (lookup failed)")
@@ -409,7 +422,7 @@ case "$CMD" in
       if fm_tunnel_launchagent_alive "$PROJECT"; then
         echo "connector:   LaunchAgent loaded and running ($(fm_tunnel_label "$PROJECT"))"
       else
-        echo "connector:   LaunchAgent installed but not loaded ($(fm_tunnel_label "$PROJECT"))"
+        echo "connector:   LaunchAgent installed but not running ($(fm_tunnel_label "$PROJECT"))"
       fi
     else
       echo "connector:   not installed"

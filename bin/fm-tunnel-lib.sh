@@ -16,15 +16,19 @@ CF_API_BASE="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
 
 # --- temp file bookkeeping ---------------------------------------------------
 
-# Every temp file lives in one per-process directory whose path is derived from
-# the main script's pid. A command-substitution subshell cannot register a file
-# with its parent, so bookkeeping must not depend on shared shell state: the
-# directory path is identical in every subshell, and the top-level trap removes
-# the whole tree on exit or signal.
-CF_TMPDIR="${TMPDIR:-/tmp}/fm-tunnel.$$"
+# Every temp file lives in one per-run directory, created here with `mktemp -d`
+# so it is unpredictable and atomically owned by the caller at mode 0700 - an
+# attacker cannot pre-create it. A command-substitution subshell cannot register
+# a file with its parent, so bookkeeping must not depend on shared shell state:
+# subshells inherit CF_TMPDIR, and the top-level trap removes the whole tree on
+# exit or signal.
+if ! CF_TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/fm-tunnel.XXXXXX" 2>/dev/null); then
+  echo "fm-tunnel: cannot create a private temp directory" >&2
+  CF_TMPDIR=""
+fi
 
 cf_mktemp() {
-  (umask 077; mkdir -p "$CF_TMPDIR") || return 1
+  [ -n "$CF_TMPDIR" ] && [ -d "$CF_TMPDIR" ] || return 1
   mktemp "$CF_TMPDIR/f.XXXXXX"
 }
 
@@ -548,11 +552,16 @@ fm_tunnel_launchagent_stop() {
   launchctl unload "$plist" >/dev/null 2>&1 || true
 }
 
-# fm_tunnel_launchagent_alive <project>: succeed if launchctl currently lists
-# the label (i.e. the agent is loaded, whether or not the process is up).
+# fm_tunnel_launchagent_alive <project>: succeed only when launchctl reports a
+# live pid for the label. A loaded-but-crashed agent lists a "-" pid and is not
+# alive, so `status` never claims a dead connector is running.
 fm_tunnel_launchagent_alive() {
-  local project=$1 label
+  local project=$1 label pid
   label=$(fm_tunnel_label "$project")
   command -v launchctl >/dev/null 2>&1 || return 1
-  launchctl list 2>/dev/null | grep -qF "$label"
+  pid=$(launchctl list 2>/dev/null | awk -v l="$label" '$3 == l { print $1; exit }')
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  return 0
 }
