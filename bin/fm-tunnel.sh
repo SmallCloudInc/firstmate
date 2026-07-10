@@ -28,12 +28,14 @@
 # `up` is idempotent: every Cloudflare resource is found-by-name/hostname
 # before it is created, so re-running never duplicates a tunnel, DNS record,
 # Access app, or Access policy - existing ones are updated in place instead.
-# It provisions the tunnel and ingress, then the Access app and its allow-
-# policy, and only then the DNS CNAME: a public route into the tunnel never
-# exists before the login gate that fronts it. A firstmate-owned DNS record is
-# rewritten on every run rather than skipped when its target already matches,
-# so a record whose proxied flag was flipped off - which bypasses Access
-# entirely - is self-healed.
+# It provisions the tunnel and ingress, then reads any DNS record already at the
+# hostname to confirm the hostname is fm-tunnel's to claim, then the Access app
+# and its allow-policy, and only then the DNS CNAME: nothing is ever created
+# against a hostname held by an unrelated record, and a public route into the
+# tunnel never exists before the login gate that fronts it. A firstmate-owned
+# DNS record is rewritten on every run rather than skipped when its target
+# already matches, so a record whose proxied flag was flipped off - which
+# bypasses Access entirely - is self-healed.
 # Every resource fm-tunnel creates carries an ownership marker (the DNS record's
 # comment, the Access app's name), and neither `up` nor `down` will update or
 # delete a pre-existing record found at the hostname that lacks this project's
@@ -48,14 +50,17 @@
 # `down` stops the connector, then deletes the DNS record, the Access policy
 # and its Access app, and the tunnel (in that order: the public route goes
 # first, so a partial failure can never leave the hostname resolvable with its
-# login gate already removed). If the DNS record is not confirmed gone - any
-# zone or record lookup failure, or a failed delete - the Access app and its
-# policy are deliberately left alive and reported as survivors rather than
-# deleted out from under a still-resolvable hostname. It removes the local
-# token file too. Safe to run
-# on a partially-provisioned or already-torn-down project. It exits non-zero,
-# with a summary of what survived, if any lookup or delete failed - so a bad
-# API token never reads as a successful teardown.
+# login gate already removed). If an fm-tunnel-owned DNS record may still be
+# live - a record read failure, a zone or record lookup failure, or a failed
+# delete - the Access app and its policy are deliberately left alive and
+# reported as survivors rather than deleted out from under a still-resolvable
+# hostname. A record that is not fm-tunnel's, or a zone that does not exist,
+# routes nothing to this tunnel, so fm-tunnel's own Access app is still removed
+# in those cases (the foreign record is reported untouched). It removes the
+# local token file too. Safe to run on a partially-provisioned or already-torn-
+# down project. It exits non-zero, with a summary of what survived, if any
+# lookup or delete failed - so a bad API token never reads as a successful
+# teardown.
 #
 # `status` reports what currently exists without changing anything, and says
 # "lookup failed" rather than "not found" when Cloudflare could not be queried.
@@ -239,9 +244,32 @@ case "$CMD" in
     fi
     echo "fm-tunnel: [2/6] ingress set: $HOSTNAME -> $SERVICE" >&2
 
-    # The Access gate is provisioned before the DNS record: a public route into
-    # the tunnel must never exist before the login gate that fronts it. An
-    # Access app with no DNS record pointing at it is harmless.
+    # Claim the hostname before creating anything against it. These lookups are
+    # read-only, so an unrelated CNAME already sitting at the hostname aborts
+    # here - before an Access app would have put a login gate in front of it.
+    DNS_CONTENT="$TUNNEL_ID.cfargotunnel.com"
+    DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
+    ZONE_ID=$(cf_zone_id "$ZONE") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; Access+DNS NOT done, nothing touched at '$HOSTNAME')" >&2; exit 1; }
+    if [ -z "$ZONE_ID" ]; then
+      echo "fm-tunnel: zone '$ZONE' not found on this account - aborting after step 2/6 (tunnel+ingress done; Access+DNS NOT done, nothing touched at '$HOSTNAME')" >&2
+      exit 1
+    fi
+    DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; Access+DNS NOT done, nothing touched at '$HOSTNAME')" >&2; exit 1; }
+    if [ -n "$DNS_ID" ]; then
+      CURRENT_RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record found but unreadable; Access+DNS NOT done, nothing touched at '$HOSTNAME')" >&2; exit 1; }
+      CURRENT_CONTENT=${CURRENT_RECORD%%$'\t'*}
+      CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
+      if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
+        echo "fm-tunnel: refusing to touch the existing CNAME at '$HOSTNAME' -> $CURRENT_CONTENT" >&2
+        echo "fm-tunnel: it is not managed by fm-tunnel for project '$PROJECT' (expected comment: $DNS_COMMENT)" >&2
+        echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record and Access app left untouched)" >&2
+        exit 1
+      fi
+    fi
+
+    # The Access gate is provisioned before the DNS record is written: a public
+    # route into the tunnel must never exist before the login gate that fronts
+    # it. An Access app with no DNS record pointing at it is harmless.
     APP_ID=$(cf_access_app_find "$HOSTNAME") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; Access/DNS NOT done)" >&2; exit 1; }
     APP_NAME=$(fm_tunnel_app_name "$PROJECT")
     if [ -n "$APP_ID" ]; then
@@ -282,24 +310,7 @@ case "$CMD" in
       exit 1
     }
 
-    ZONE_ID=$(cf_zone_id "$ZONE") || { echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+Access done; DNS NOT done)" >&2; exit 1; }
-    if [ -z "$ZONE_ID" ]; then
-      echo "fm-tunnel: zone '$ZONE' not found on this account - aborting after step 4/6 (tunnel+ingress+Access done; DNS NOT done)" >&2
-      exit 1
-    fi
-    DNS_CONTENT="$TUNNEL_ID.cfargotunnel.com"
-    DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
-    DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME") || { echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+Access done; DNS NOT done)" >&2; exit 1; }
     if [ -n "$DNS_ID" ]; then
-      CURRENT_RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+Access done; DNS record found but unreadable)" >&2; exit 1; }
-      CURRENT_CONTENT=${CURRENT_RECORD%%$'\t'*}
-      CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
-      if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
-        echo "fm-tunnel: refusing to touch the existing CNAME at '$HOSTNAME' -> $CURRENT_CONTENT" >&2
-        echo "fm-tunnel: it is not managed by fm-tunnel for project '$PROJECT' (expected comment: $DNS_COMMENT)" >&2
-        echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+Access done; DNS record left untouched)" >&2
-        exit 1
-      fi
       # Always rewrite: the marker proves ownership, and content is not the only
       # field that matters - a record whose proxied flag was flipped off bypasses
       # Access entirely, so every `up` re-run restates the full desired record.
@@ -388,25 +399,29 @@ case "$CMD" in
     HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
     if [ -n "$HOSTNAME" ]; then
       # The DNS record goes first: it is the public route. The Access gate is
-      # only removed once that route is confirmed gone, so no partial failure
-      # can leave the service reachable with its login gate already deleted.
-      ROUTE_GONE=0
+      # only removed once no fm-tunnel-owned route into this tunnel can still be
+      # live, so no partial failure can leave the service reachable with its
+      # login gate already deleted. A record that is not ours - or a zone that
+      # does not exist - routes nothing here, so it never holds the gate hostage.
+      OUR_ROUTE_MAY_BE_LIVE=1
       ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
+            OUR_ROUTE_MAY_BE_LIVE=0
             SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not found)")
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -z "$DNS_ID" ]; then
-              ROUTE_GONE=1
+              OUR_ROUTE_MAY_BE_LIVE=0
             elif ! CURRENT_RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID"); then
               SURVIVORS+=("DNS record $DNS_ID (read failed; left untouched)")
             else
               CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
               if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
+                OUR_ROUTE_MAY_BE_LIVE=0
                 SURVIVORS+=("DNS record $DNS_ID for '$HOSTNAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
               elif cf_dns_delete "$ZONE_ID" "$DNS_ID"; then
-                ROUTE_GONE=1
+                OUR_ROUTE_MAY_BE_LIVE=0
               else
                 SURVIVORS+=("DNS record $DNS_ID (delete failed)")
               fi
@@ -421,8 +436,8 @@ case "$CMD" in
         SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in)")
       fi
 
-      if [ "$ROUTE_GONE" -eq 0 ]; then
-        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above is still live, and removing its login gate would expose the service)")
+      if [ "$OUR_ROUTE_MAY_BE_LIVE" -eq 1 ]; then
+        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above may still route to this tunnel, and removing its login gate would expose the service)")
       elif APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -n "$APP_ID" ]; then
           if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
@@ -500,6 +515,7 @@ case "$CMD" in
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
+            LOOKUP_FAILED=1
             echo "dns:         zone '$ZONE' not found"
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -n "$DNS_ID" ]; then
