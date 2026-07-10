@@ -68,19 +68,20 @@ fm_tunnel_project_var() {
 }
 
 # fm_tunnel_load_config: read CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID from
-# $FM_HOME/config/cloudflare.env into CF_TOKEN / CF_ACCOUNT_ID. An explicit
-# process environment variable always wins over the file. Prints nothing;
+# $FM_HOME/config/cloudflare.env into CF_TOKEN / CF_ACCOUNT_ID. A non-empty
+# process environment variable wins over the file, matching fm_tunnel_resolve.
+# An exported-but-empty variable falls through to the file. Prints nothing;
 # callers check whether CF_TOKEN/CF_ACCOUNT_ID ended up non-empty.
 fm_tunnel_load_config() {
   local env_file="${FM_TUNNEL_CONFIG_FILE:-$FM_HOME/config/cloudflare.env}"
   FM_TUNNEL_CONFIG_FILE_RESOLVED=$env_file
-  if [ -n "${CLOUDFLARE_API_TOKEN+x}" ]; then
-    CF_TOKEN=${CLOUDFLARE_API_TOKEN-}
+  if [ -n "${CLOUDFLARE_API_TOKEN-}" ]; then
+    CF_TOKEN=$CLOUDFLARE_API_TOKEN
   else
     CF_TOKEN=$(fm_tunnel_env_get CLOUDFLARE_API_TOKEN "$env_file")
   fi
-  if [ -n "${CLOUDFLARE_ACCOUNT_ID+x}" ]; then
-    CF_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID-}
+  if [ -n "${CLOUDFLARE_ACCOUNT_ID-}" ]; then
+    CF_ACCOUNT_ID=$CLOUDFLARE_ACCOUNT_ID
   else
     CF_ACCOUNT_ID=$(fm_tunnel_env_get CLOUDFLARE_ACCOUNT_ID "$env_file")
   fi
@@ -368,12 +369,16 @@ cf_dns_delete() {
 }
 
 # cf_access_app_find <hostname>: print the app id for an exact domain match.
+# The domain= filter is a server-side hint, not a guarantee, so every page is
+# walked and re-filtered client-side: an existing app must never be missed, or
+# `up` would duplicate it and `down` would report a still-live gate as gone.
 cf_access_app_find() {
-  local hostname=$1 enc
+  local hostname=$1 enc page=1 total found
   enc=$(cf_urlencode "$hostname")
-  cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps?domain=$enc" || return 2
-  cf_check_ok "list Access apps for '$hostname'" || return 1
-  printf '%s' "$CF_BODY" | python3 -c '
+  while :; do
+    cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps?domain=$enc&per_page=50&page=$page" || return 2
+    cf_check_ok "list Access apps for '$hostname'" || return 1
+    found=$(printf '%s' "$CF_BODY" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 hostname = sys.argv[1]
@@ -381,7 +386,15 @@ for a in (d.get("result") or []):
     if a.get("domain") == hostname:
         print(a.get("id",""))
         break
-' "$hostname"
+' "$hostname")
+    if [ -n "$found" ]; then
+      printf '%s\n' "$found"
+      return 0
+    fi
+    total=$(cf_extract '(d.get("result_info") or {}).get("total_pages") or 0')
+    [ -n "$total" ] && [ "$total" -gt "$page" ] 2>/dev/null || return 0
+    page=$((page + 1))
+  done
 }
 
 # cf_access_app_current_name <app_id>: print the app's current name (the

@@ -39,9 +39,10 @@
 # token is stored gitignored at $FM_HOME/config/tunnel-<project>.token (0600)
 # and is never printed to stdout/stderr/logs.
 #
-# `down` stops the connector, then deletes the Access policy, Access app, DNS
-# record, and tunnel (in that order so nothing keeps a dangling reference to
-# something already removed), and removes the local token file. Safe to run
+# `down` stops the connector, then deletes the DNS record, the Access policy
+# and its Access app, and the tunnel (in that order: the public route goes
+# first, so a partial failure can never leave the hostname resolvable with its
+# login gate already removed), and removes the local token file. Safe to run
 # on a partially-provisioned or already-torn-down project. It exits non-zero,
 # with a summary of what survived, if any lookup or delete failed - so a bad
 # API token never reads as a successful teardown.
@@ -374,33 +375,9 @@ case "$CMD" in
     DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
     HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
     if [ -n "$HOSTNAME" ]; then
-      if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
-        if [ -n "$APP_ID" ]; then
-          if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
-            SURVIVORS+=("Access app $APP_ID (read failed; left untouched)")
-          elif [ "$CURRENT_APP_NAME" != "$APP_NAME" ]; then
-            SURVIVORS+=("Access app $APP_ID named '$CURRENT_APP_NAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
-          else
-            # Deleting the Access app removes its policies with it, so a policy
-            # problem only survives when the app delete also fails.
-            POLICY_SURVIVOR=""
-            if POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
-              if [ -n "$POLICY_ID" ]; then
-                cf_access_policy_delete "$APP_ID" "$POLICY_ID" || POLICY_SURVIVOR="Access policy $POLICY_ID (delete failed)"
-              fi
-            else
-              POLICY_SURVIVOR="Access policy for app $APP_ID (lookup failed)"
-            fi
-            if ! cf_access_app_delete "$APP_ID"; then
-              SURVIVORS+=("Access app $APP_ID (delete failed)")
-              [ -n "$POLICY_SURVIVOR" ] && SURVIVORS+=("$POLICY_SURVIVOR")
-            fi
-          fi
-        fi
-      else
-        SURVIVORS+=("Access app for '$HOSTNAME' (lookup failed)")
-      fi
-
+      # The DNS record goes first: it is the public route. If a later delete
+      # fails, the hostname is already unresolvable, so no partial-failure
+      # window can leave the service reachable with its login gate removed.
       ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
@@ -428,8 +405,35 @@ case "$CMD" in
       else
         SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in)")
       fi
+
+      if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
+        if [ -n "$APP_ID" ]; then
+          if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
+            SURVIVORS+=("Access app $APP_ID (read failed; left untouched)")
+          elif [ "$CURRENT_APP_NAME" != "$APP_NAME" ]; then
+            SURVIVORS+=("Access app $APP_ID named '$CURRENT_APP_NAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
+          else
+            # Deleting the Access app removes its policies with it, so a policy
+            # problem only survives when the app delete also fails.
+            POLICY_SURVIVOR=""
+            if POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
+              if [ -n "$POLICY_ID" ]; then
+                cf_access_policy_delete "$APP_ID" "$POLICY_ID" || POLICY_SURVIVOR="Access policy $POLICY_ID (delete failed)"
+              fi
+            else
+              POLICY_SURVIVOR="Access policy for app $APP_ID (lookup failed)"
+            fi
+            if ! cf_access_app_delete "$APP_ID"; then
+              SURVIVORS+=("Access app $APP_ID (delete failed)")
+              [ -n "$POLICY_SURVIVOR" ] && SURVIVORS+=("$POLICY_SURVIVOR")
+            fi
+          fi
+        fi
+      else
+        SURVIVORS+=("Access app for '$HOSTNAME' (lookup failed)")
+      fi
     else
-      SURVIVORS+=("Access app and DNS record (no hostname configured to look them up by)")
+      SURVIVORS+=("DNS record and Access app (no hostname configured to look them up by)")
     fi
 
     if TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME"); then
