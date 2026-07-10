@@ -7,8 +7,8 @@
 #   fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] \
 #                              [--service <url>] [--emails <e1,e2,...>] \
 #                              [--install-cloudflared]
-#   fm-tunnel.sh down <project>
-#   fm-tunnel.sh status <project>
+#   fm-tunnel.sh down <project> [--zone <zone>]
+#   fm-tunnel.sh status <project> [--zone <zone>]
 #   fm-tunnel.sh --help
 #
 # Config precedence per setting (hostname/zone/service/emails), highest first:
@@ -18,8 +18,10 @@
 # <PROJECT> is <project> upper-cased with every non [A-Z0-9] character folded
 # to '_' (e.g. project "house-hunter" -> FM_TUNNEL_HOUSE_HUNTER_HOSTNAME).
 # Missing a required setting after all three is a hard error naming exactly
-# what to set. Those four flags are only valid for `up`; `down` and `status`
-# always act on the configured settings.
+# what to set. --hostname, --service, --emails and --install-cloudflared are
+# only valid for `up`. --zone is accepted by all three commands, so a project
+# provisioned with an ad-hoc --zone that was never written to cloudflare.env can
+# still be torn down or inspected by passing that same --zone.
 #
 # $FM_HOME/config/cloudflare.env (gitignored) also carries the account-wide
 # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID. See AGENTS.md for the
@@ -51,17 +53,19 @@
 # and its Access app, and the tunnel (in that order: the public route goes
 # first, so a partial failure can never leave the hostname resolvable with its
 # login gate already removed). If an fm-tunnel-owned DNS record may still be
-# live - a record read failure, a zone or record lookup failure, or a failed
-# delete - the Access app and its policy are deliberately left alive and
-# reported as survivors rather than deleted out from under a still-resolvable
-# hostname. A record that is not fm-tunnel's, a zone that does not exist, or no
-# configured zone at all (`up` cannot create a record without one) routes nothing
-# to this tunnel, so fm-tunnel's own Access app is still removed in those cases
-# (the foreign or unverifiable record is reported untouched). It removes the
-# local token file too. Safe to run on a partially-provisioned or already-torn-
-# down project. It exits non-zero, with a summary of what survived, if any
-# lookup or delete failed - so a bad API token never reads as a successful
-# teardown.
+# live - a record read failure, a zone or record lookup failure, a failed
+# delete, or no zone to look the record up in - the Access app and its policy
+# are deliberately left alive and reported as survivors rather than deleted out
+# from under a possibly-resolvable hostname; the gate goes only once the absence
+# of an fm-tunnel-owned route is confirmed, never on the assumption that none was
+# created. A record that is not fm-tunnel's, or a zone that does not exist,
+# routes nothing to this tunnel, so fm-tunnel's own Access app is still removed
+# in those cases (the foreign record is reported untouched). When the zone is
+# simply not configured, re-run with `--zone <zone>` to finish the teardown. It
+# removes the local token file too. Safe to run on a partially-provisioned or
+# already-torn-down project. It exits non-zero, with a summary of what survived,
+# if any lookup or delete failed - so a bad API token never reads as a
+# successful teardown.
 #
 # `status` reports what currently exists without changing anything, and says
 # "lookup failed" rather than "not found" when Cloudflare could not be queried.
@@ -84,8 +88,8 @@ trap 'cf_cleanup_tmp; exit 143' TERM
 usage() {
   cat >&2 <<'EOF'
 usage: fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] [--service <url>] [--emails <e1,e2,...>] [--install-cloudflared]
-       fm-tunnel.sh down <project>
-       fm-tunnel.sh status <project>
+       fm-tunnel.sh down <project> [--zone <zone>]
+       fm-tunnel.sh status <project> [--zone <zone>]
        fm-tunnel.sh --help
 EOF
 }
@@ -142,7 +146,6 @@ while [ $# -gt 0 ]; do
       [ $# -ge 2 ] || { echo "fm-tunnel: --hostname requires a value" >&2; exit 2; }
       CLI_HOSTNAME=$2; shift 2 ;;
     --zone)
-      up_only "$1"
       [ $# -ge 2 ] || { echo "fm-tunnel: --zone requires a value" >&2; exit 2; }
       CLI_ZONE=$2; shift 2 ;;
     --service)
@@ -406,8 +409,10 @@ case "$CMD" in
       # live, so no partial failure can leave the service reachable with its
       # login gate already deleted. A record that is not ours - or a zone that
       # does not exist - routes nothing here, so it never holds the gate hostage.
+      # The gate is only ever removed once the absence of our route has actually
+      # been confirmed, never on an assumption that none was created.
       OUR_ROUTE_MAY_BE_LIVE=1
-      ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "" 2>/dev/null || true)
+      ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "$CLI_ZONE" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
@@ -436,14 +441,13 @@ case "$CMD" in
           SURVIVORS+=("DNS record for '$HOSTNAME' (zone lookup failed)")
         fi
       else
-        # `up` hard-requires a zone to create a record, so without one fm-tunnel
-        # never routed this hostname and has no route to protect: the gate can go.
-        OUR_ROUTE_MAY_BE_LIVE=0
-        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in; state unconfirmed)")
+        # `up` accepts an ad-hoc --zone, so a hostname with no zone in the config
+        # may still have been routed. Never assume; ask for the zone instead.
+        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in; state unconfirmed - re-run: fm-tunnel.sh down $PROJECT --zone <zone>)")
       fi
 
       if [ "$OUR_ROUTE_MAY_BE_LIVE" -eq 1 ]; then
-        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above may still route to this tunnel, and removing its login gate would expose the service)")
+        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above could not be confirmed gone, and its login gate is not removed until it is; the tunnel itself is deleted below, so nothing behind that gate is reachable meanwhile)")
       elif APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -n "$APP_ID" ]; then
           if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
@@ -517,7 +521,7 @@ case "$CMD" in
     fi
 
     if [ -n "$HOSTNAME" ]; then
-      ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "" 2>/dev/null || true)
+      ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "$CLI_ZONE" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
@@ -565,7 +569,8 @@ case "$CMD" in
         echo "access app:  lookup failed (see error above)"
       fi
     else
-      echo "hostname:    not configured (no --hostname / FM_TUNNEL_*_HOSTNAME) - skipping DNS/Access status"
+      LOOKUP_FAILED=1
+      echo "hostname:    not configured (no FM_TUNNEL_*_HOSTNAME) - skipping DNS/Access status"
     fi
 
     if fm_tunnel_launchagent_loaded "$PROJECT"; then
