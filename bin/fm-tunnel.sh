@@ -230,6 +230,13 @@ case "$CMD" in
     fi
 
     TUNNEL_NAME="firstmate-$PROJECT"
+    # Carry the resolved hostname and zone into every suggested command: they may
+    # have come from ad-hoc flags rather than the config file, and a bare
+    # `down <project>` would then resolve neither and skip the very DNS and
+    # Access deletions these messages are warning about.
+    DOWN_CMD="fm-tunnel.sh down $PROJECT --hostname $HOSTNAME --zone $ZONE"
+    # shellcheck disable=SC2153  # SERVICE is set indirectly by resolve_or_die
+    UP_CMD="fm-tunnel.sh up $PROJECT --hostname $HOSTNAME --zone $ZONE --service $SERVICE --emails $EMAILS_RAW"
     echo "fm-tunnel: provisioning '$PROJECT' -> https://$HOSTNAME (tunnel '$TUNNEL_NAME', zone '$ZONE')" >&2
 
     TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME") || { echo "fm-tunnel: aborting; nothing else was touched" >&2; exit 1; }
@@ -237,13 +244,13 @@ case "$CMD" in
       echo "fm-tunnel: [1/6] tunnel '$TUNNEL_NAME' already exists ($TUNNEL_ID)" >&2
     else
       TUNNEL_ID=$(cf_tunnel_create "$TUNNEL_NAME") || {
-        echo "fm-tunnel: aborting after step 1/6 (a tunnel named '$TUNNEL_NAME' may have been created; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        echo "fm-tunnel: aborting after step 1/6 (a tunnel named '$TUNNEL_NAME' may have been created; run '$DOWN_CMD' to clean up)" >&2
         exit 1
       }
       echo "fm-tunnel: [1/6] created tunnel '$TUNNEL_NAME' ($TUNNEL_ID)" >&2
     fi
     [ -n "$TUNNEL_ID" ] || {
-      echo "fm-tunnel: Cloudflare did not return a tunnel id - a tunnel named '$TUNNEL_NAME' may exist; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      echo "fm-tunnel: Cloudflare did not return a tunnel id - a tunnel named '$TUNNEL_NAME' may exist; run '$DOWN_CMD' to clean up" >&2
       exit 1
     }
 
@@ -295,13 +302,13 @@ case "$CMD" in
       echo "fm-tunnel: [3/6] Access app already exists ($APP_ID), updated" >&2
     else
       APP_ID=$(cf_access_app_create "$HOSTNAME" "$APP_NAME") || {
-        echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; an Access app named '$APP_NAME' may have been created; DNS NOT done; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; an Access app named '$APP_NAME' may have been created; DNS NOT done; run '$DOWN_CMD' to clean up)" >&2
         exit 1
       }
       echo "fm-tunnel: [3/6] created Access app ($APP_ID)" >&2
     fi
     [ -n "$APP_ID" ] || {
-      echo "fm-tunnel: Cloudflare did not return an Access app id - an Access app named '$APP_NAME' may exist; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      echo "fm-tunnel: Cloudflare did not return an Access app id - an Access app named '$APP_NAME' may exist; run '$DOWN_CMD' to clean up" >&2
       exit 1
     }
 
@@ -311,13 +318,13 @@ case "$CMD" in
       echo "fm-tunnel: [4/6] Access policy already exists, updated to allow: ${TRIMMED_EMAILS[*]}" >&2
     else
       POLICY_ID=$(cf_access_policy_create "$APP_ID" "${TRIMMED_EMAILS[@]}") || {
-        echo "fm-tunnel: aborting after step 3/6 (Access app done; an Access policy may have been created on app $APP_ID; DNS NOT done; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        echo "fm-tunnel: aborting after step 3/6 (Access app done; an Access policy may have been created on app $APP_ID; DNS NOT done; run '$DOWN_CMD' to clean up)" >&2
         exit 1
       }
       echo "fm-tunnel: [4/6] created Access policy allowing: ${TRIMMED_EMAILS[*]}" >&2
     fi
     [ -n "$POLICY_ID" ] || {
-      echo "fm-tunnel: Cloudflare did not return an Access policy id - a policy may exist on app $APP_ID; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      echo "fm-tunnel: Cloudflare did not return an Access policy id - a policy may exist on app $APP_ID; run '$DOWN_CMD' to clean up" >&2
       exit 1
     }
 
@@ -329,13 +336,13 @@ case "$CMD" in
       echo "fm-tunnel: [5/6] DNS CNAME up to date: $HOSTNAME -> $DNS_CONTENT" >&2
     else
       DNS_ID=$(cf_dns_create "$ZONE_ID" "$HOSTNAME" "$DNS_CONTENT" "$DNS_COMMENT") || {
-        echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+Access done; a CNAME at '$HOSTNAME' may have been created; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+Access done; a CNAME at '$HOSTNAME' may have been created; run '$DOWN_CMD' to clean up)" >&2
         exit 1
       }
       echo "fm-tunnel: [5/6] created DNS CNAME: $HOSTNAME -> $DNS_CONTENT" >&2
     fi
     [ -n "$DNS_ID" ] || {
-      echo "fm-tunnel: Cloudflare did not return a DNS record id - a CNAME at '$HOSTNAME' may exist; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      echo "fm-tunnel: Cloudflare did not return a DNS record id - a CNAME at '$HOSTNAME' may exist; run '$DOWN_CMD' to clean up" >&2
       exit 1
     }
 
@@ -356,7 +363,7 @@ case "$CMD" in
       fm_tunnel_write_wrapper "$PROJECT" || { echo "fm-tunnel: cannot write connector wrapper script" >&2; exit 1; }
       fm_tunnel_write_plist "$PROJECT" || { echo "fm-tunnel: cannot write LaunchAgent plist" >&2; exit 1; }
       if ! fm_tunnel_launchagent_start "$PROJECT"; then
-        echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector failed to start - retry with: fm-tunnel.sh up $PROJECT)" >&2
+        echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector failed to start - retry with: $UP_CMD)" >&2
         exit 1
       fi
       CONNECTOR_UP=0
@@ -366,7 +373,7 @@ case "$CMD" in
       done
       if [ "$CONNECTOR_UP" -eq 0 ]; then
         echo "fm-tunnel: connector did not stay up - see $(fm_tunnel_log_path "$PROJECT" err)" >&2
-        echo "fm-tunnel: the LaunchAgent $(fm_tunnel_label "$PROJECT") IS loaded and launchd keeps respawning it in the background; run 'fm-tunnel.sh down $PROJECT' to stop it" >&2
+        echo "fm-tunnel: the LaunchAgent $(fm_tunnel_label "$PROJECT") IS loaded and launchd keeps respawning it in the background; run '$DOWN_CMD' to stop it" >&2
         echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector not running)" >&2
         exit 1
       fi
@@ -408,6 +415,12 @@ case "$CMD" in
     APP_NAME=$(fm_tunnel_app_name "$PROJECT")
     DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
     HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "$CLI_HOSTNAME" 2>/dev/null || true)
+    ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "$CLI_ZONE" 2>/dev/null || true)
+    # A retry must resolve the same hostname and zone this run did, which may
+    # have come from ad-hoc flags rather than the config file.
+    RETRY_CMD="fm-tunnel.sh down $PROJECT"
+    [ -n "$HOSTNAME" ] && RETRY_CMD="$RETRY_CMD --hostname $HOSTNAME"
+    [ -n "$ZONE" ] && RETRY_CMD="$RETRY_CMD --zone $ZONE"
     if [ -n "$HOSTNAME" ]; then
       # The DNS record goes first: it is the public route. The Access gate is
       # only removed once no fm-tunnel-owned route into this tunnel can still be
@@ -419,7 +432,6 @@ case "$CMD" in
       # the token cannot see, no zone configured - is unconfirmed, and the gate
       # stays, never removed on an assumption that no route was created.
       OUR_ROUTE_MAY_BE_LIVE=1
-      ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "$CLI_ZONE" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
@@ -427,7 +439,7 @@ case "$CMD" in
             # API token may lack Zone:Read for it (Cloudflare answers 200 with
             # an empty result), or the zone name may be a typo. In the latter
             # two the real record is still live, so this is unconfirmed.
-            SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not visible to this API token; state unconfirmed - check the zone name and the token's Zone:Read scope, or pass --zone <zone>, then re-run: fm-tunnel.sh down $PROJECT)")
+            SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not visible to this API token; state unconfirmed - check the zone name and the token's Zone:Read scope, or pass the correct --zone, then re-run: $RETRY_CMD)")
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -z "$DNS_ID" ]; then
               OUR_ROUTE_MAY_BE_LIVE=0
@@ -455,17 +467,19 @@ case "$CMD" in
       else
         # `up` accepts an ad-hoc --zone, so a hostname with no zone in the config
         # may still have been routed. Never assume; ask for the zone instead.
-        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in; state unconfirmed - re-run: fm-tunnel.sh down $PROJECT --zone <zone>)")
+        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in; state unconfirmed - re-run: $RETRY_CMD --zone <zone>)")
       fi
 
       if [ "$OUR_ROUTE_MAY_BE_LIVE" -eq 1 ]; then
-        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above could not be confirmed gone, and its login gate is not removed until it is)")
+        SURVIVORS+=("any Access app for '$HOSTNAME' (left in place on purpose, unverified: the DNS record above could not be confirmed gone, and its login gate is not removed until it is)")
       elif APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -n "$APP_ID" ]; then
           if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
             SURVIVORS+=("Access app $APP_ID (read failed; left untouched)")
           elif [ "$CURRENT_APP_NAME" != "$APP_NAME" ]; then
-            SURVIVORS+=("Access app $APP_ID named '$CURRENT_APP_NAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
+            # A foreign app was never ours to delete, so it is not a teardown
+            # failure and must not force a permanent non-zero exit.
+            echo "fm-tunnel: Access app $APP_ID named '$CURRENT_APP_NAME' is not managed by fm-tunnel for '$PROJECT' - left untouched" >&2
           else
             # Deleting the Access app removes its policies with it, so a policy
             # problem only survives when the app delete also fails.
@@ -487,7 +501,9 @@ case "$CMD" in
         SURVIVORS+=("Access app for '$HOSTNAME' (lookup failed)")
       fi
     else
-      SURVIVORS+=("DNS record and Access app (no hostname configured to look them up by; state unconfirmed - re-run: fm-tunnel.sh down $PROJECT --hostname <host> --zone <zone>)")
+      MISSING_ARGS="--hostname <host>"
+      [ -n "$ZONE" ] || MISSING_ARGS="$MISSING_ARGS --zone <zone>"
+      SURVIVORS+=("DNS record and Access app (no hostname configured to look them up by; state unconfirmed - re-run: $RETRY_CMD $MISSING_ARGS)")
     fi
 
     if TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME"); then
@@ -507,7 +523,7 @@ case "$CMD" in
       for s in "${SURVIVORS[@]}"; do
         echo "fm-tunnel:   - $s" >&2
       done
-      echo "fm-tunnel: fix the cause above and re-run: fm-tunnel.sh down $PROJECT" >&2
+      echo "fm-tunnel: fix the cause above and re-run: $RETRY_CMD" >&2
       exit 1
     fi
     echo "fm-tunnel: '$PROJECT' torn down" >&2
