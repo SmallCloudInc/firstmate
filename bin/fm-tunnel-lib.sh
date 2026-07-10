@@ -16,18 +16,21 @@ CF_API_BASE="${CF_API_BASE:-https://api.cloudflare.com/client/v4}"
 
 # --- temp file bookkeeping ---------------------------------------------------
 
-CF_TMP_FILES=()
+# Every temp file lives in one per-process directory whose path is derived from
+# the main script's pid. A command-substitution subshell cannot register a file
+# with its parent, so bookkeeping must not depend on shared shell state: the
+# directory path is identical in every subshell, and the top-level trap removes
+# the whole tree on exit or signal.
+CF_TMPDIR="${TMPDIR:-/tmp}/fm-tunnel.$$"
 
 cf_mktemp() {
-  local f
-  f=$(mktemp "${TMPDIR:-/tmp}/fm-tunnel.XXXXXX") || return 1
-  CF_TMP_FILES+=("$f")
-  printf '%s\n' "$f"
+  (umask 077; mkdir -p "$CF_TMPDIR") || return 1
+  mktemp "$CF_TMPDIR/f.XXXXXX"
 }
 
 cf_cleanup_tmp() {
-  if [ "${#CF_TMP_FILES[@]}" -gt 0 ]; then
-    rm -f "${CF_TMP_FILES[@]}"
+  if [ -n "${CF_TMPDIR:-}" ]; then
+    rm -rf "$CF_TMPDIR"
   fi
 }
 
@@ -108,7 +111,7 @@ cf_auth_header_file() {
   case "$CF_TOKEN" in
     *$'\n'*|*$'\r'*) return 1 ;;
   esac
-  file=$(umask 077; mktemp "${TMPDIR:-/tmp}/fm-tunnel-auth.XXXXXX") || return 1
+  file=$(cf_mktemp) || return 1
   chmod 600 "$file" 2>/dev/null || { rm -f "$file"; return 1; }
   printf 'Authorization: Bearer %s\n' "$CF_TOKEN" > "$file" || { rm -f "$file"; return 1; }
   printf '%s\n' "$file"
@@ -119,29 +122,25 @@ cf_urlencode() {
 }
 
 # cf_request <METHOD> <path-and-query> [json-body]: call the Cloudflare API.
-# Sets CF_HTTP_CODE (string) and CF_BODY_FILE (path to the raw JSON response,
-# valid until the next cf_request call or process exit). Returns non-zero only
-# on a transport failure (curl missing, network error); HTTP error codes are
-# still captured in CF_HTTP_CODE for the caller to check with cf_check_ok.
+# Sets CF_HTTP_CODE (string) and CF_BODY (the raw JSON response). The response
+# never touches disk, so a run-token in a body cannot outlive the process even
+# if it is killed mid-request. Returns non-zero only on a transport failure
+# (curl missing, network error); HTTP error codes are still captured in
+# CF_HTTP_CODE for the caller to check with cf_check_ok.
 cf_request() {
   local method=$1 path=$2 body=${3:-}
   command -v curl >/dev/null 2>&1 || { echo "fm-tunnel: curl not found" >&2; return 1; }
-  local auth_file body_file req_file=
+  local auth_file resp rc
   auth_file=$(cf_auth_header_file) || { echo "fm-tunnel: cannot prepare auth header" >&2; return 1; }
-  body_file=$(cf_mktemp) || { rm -f "$auth_file"; return 1; }
-  CF_BODY_FILE=$body_file
-  local rc
   if [ -n "$body" ]; then
-    req_file=$(cf_mktemp) || { rm -f "$auth_file"; return 1; }
-    printf '%s' "$body" > "$req_file"
-    CF_HTTP_CODE=$(curl -sS -m 20 -o "$body_file" -w '%{http_code}' -X "$method" \
+    resp=$(printf '%s' "$body" | curl -sS -m 20 -w '\n%{http_code}' -X "$method" \
       -H "@$auth_file" -H 'Content-Type: application/json' \
-      --data-binary "@$req_file" "${CF_API_BASE}${path}" 2>/dev/null)
+      --data-binary @- "${CF_API_BASE}${path}")
     rc=$?
   else
-    CF_HTTP_CODE=$(curl -sS -m 20 -o "$body_file" -w '%{http_code}' -X "$method" \
+    resp=$(curl -sS -m 20 -w '\n%{http_code}' -X "$method" \
       -H "@$auth_file" -H 'Content-Type: application/json' \
-      "${CF_API_BASE}${path}" 2>/dev/null)
+      "${CF_API_BASE}${path}")
     rc=$?
   fi
   rm -f "$auth_file"
@@ -149,25 +148,25 @@ cf_request() {
     echo "fm-tunnel: request to Cloudflare API failed (network error)" >&2
     return 1
   fi
+  CF_HTTP_CODE=${resp##*$'\n'}
+  CF_BODY=${resp%$'\n'*}
   return 0
 }
 
-# cf_error_message <body-file>: join Cloudflare's "errors[].message" entries
+# cf_error_message: join Cloudflare's "errors[].message" entries from CF_BODY
 # into one string, or print nothing if the body has no errors array.
 cf_error_message() {
-  local file=$1
-  python3 -c '
+  printf '%s' "${CF_BODY:-}" | python3 -c '
 import json, sys
 try:
-    with open(sys.argv[1]) as f:
-        d = json.load(f)
+    d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
 errs = d.get("errors") if isinstance(d, dict) else None
 if errs:
     msgs = [str(e.get("message", e)) if isinstance(e, dict) else str(e) for e in errs]
     print("; ".join(msgs))
-' "$file" 2>/dev/null
+' 2>/dev/null
 }
 
 # cf_check_ok <context-label>: verify the last cf_request succeeded (2xx).
@@ -177,7 +176,7 @@ cf_check_ok() {
     2[0-9][0-9]) return 0 ;;
     *)
       local msg
-      msg=$(cf_error_message "$CF_BODY_FILE")
+      msg=$(cf_error_message)
       echo "fm-tunnel: $1 failed (HTTP ${CF_HTTP_CODE:-?})${msg:+: $msg}" >&2
       return 1
       ;;
@@ -185,13 +184,12 @@ cf_check_ok() {
 }
 
 cf_extract() {
-  # cf_extract <body-file> <python-expr-of-loaded-json-'d'>
-  local file=$1 expr=$2
-  python3 -c '
+  # cf_extract <python-expr-of-loaded-json-'d'>, reading the body from CF_BODY
+  local expr=$1
+  printf '%s' "${CF_BODY:-}" | python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-expr = sys.argv[2]
+d = json.load(sys.stdin)
+expr = sys.argv[1]
 result = eval(expr, {"__builtins__": {}}, {"d": d})
 if result is None:
     pass
@@ -199,7 +197,7 @@ elif isinstance(result, (dict, list)):
     print(json.dumps(result))
 else:
     print(result)
-' "$file" "$expr" 2>/dev/null
+' "$expr" 2>/dev/null
 }
 
 # --- request body builders (argv-only, never interpolated into python source) -
@@ -257,16 +255,15 @@ cf_tunnel_find() {
   enc=$(cf_urlencode "$name")
   cf_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel?name=$enc&is_deleted=false" || return 2
   cf_check_ok "list tunnels" || return 1
-  python3 -c '
+  printf '%s' "$CF_BODY" | python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-name = sys.argv[2]
+d = json.load(sys.stdin)
+name = sys.argv[1]
 for t in (d.get("result") or []):
     if t.get("name") == name and not t.get("deleted_at"):
         print(t.get("id",""))
         break
-' "$CF_BODY_FILE" "$name"
+' "$name"
 }
 
 # cf_tunnel_create <name>: create a remotely-managed tunnel, print its id.
@@ -275,7 +272,7 @@ cf_tunnel_create() {
   body=$(cf_body_tunnel_create "$name")
   cf_request POST "/accounts/$CF_ACCOUNT_ID/cfd_tunnel" "$body" || return 2
   cf_check_ok "create tunnel '$name'" || return 1
-  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+  cf_extract 'd.get("result",{}).get("id","")'
 }
 
 # cf_tunnel_set_ingress <tunnel_id> <hostname> <service>: set the tunnel's
@@ -292,7 +289,7 @@ cf_tunnel_token() {
   local id=$1
   cf_request GET "/accounts/$CF_ACCOUNT_ID/cfd_tunnel/$id/token" || return 2
   cf_check_ok "fetch run-token for tunnel $id" || return 1
-  cf_extract "$CF_BODY_FILE" 'd.get("result","")'
+  cf_extract 'd.get("result","")'
 }
 
 # cf_tunnel_delete <tunnel_id>
@@ -308,7 +305,7 @@ cf_zone_id() {
   enc=$(cf_urlencode "$zone")
   cf_request GET "/zones?name=$enc" || return 2
   cf_check_ok "look up zone '$zone'" || return 1
-  cf_extract "$CF_BODY_FILE" '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
+  cf_extract '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
 }
 
 # cf_dns_find <zone_id> <hostname>: print the CNAME record id, or nothing.
@@ -317,7 +314,7 @@ cf_dns_find() {
   enc=$(cf_urlencode "$hostname")
   cf_request GET "/zones/$zone_id/dns_records?type=CNAME&name=$enc" || return 2
   cf_check_ok "look up DNS record for '$hostname'" || return 1
-  cf_extract "$CF_BODY_FILE" '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
+  cf_extract '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
 }
 
 # cf_dns_current_content <zone_id> <record_id>: print the record's current
@@ -326,7 +323,7 @@ cf_dns_current_content() {
   local zone_id=$1 record_id=$2
   cf_request GET "/zones/$zone_id/dns_records/$record_id" || return 2
   cf_check_ok "read DNS record $record_id" || return 1
-  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("content","")'
+  cf_extract 'd.get("result",{}).get("content","")'
 }
 
 # cf_dns_create <zone_id> <hostname> <content>: create the proxied CNAME.
@@ -335,7 +332,7 @@ cf_dns_create() {
   body=$(cf_body_dns_record "$hostname" "$content")
   cf_request POST "/zones/$zone_id/dns_records" "$body" || return 2
   cf_check_ok "create DNS record for '$hostname'" || return 1
-  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+  cf_extract 'd.get("result",{}).get("id","")'
 }
 
 # cf_dns_update <zone_id> <record_id> <hostname> <content>
@@ -359,16 +356,15 @@ cf_access_app_find() {
   enc=$(cf_urlencode "$hostname")
   cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps?domain=$enc" || return 2
   cf_check_ok "list Access apps for '$hostname'" || return 1
-  python3 -c '
+  printf '%s' "$CF_BODY" | python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-hostname = sys.argv[2]
+d = json.load(sys.stdin)
+hostname = sys.argv[1]
 for a in (d.get("result") or []):
     if a.get("domain") == hostname:
         print(a.get("id",""))
         break
-' "$CF_BODY_FILE" "$hostname"
+' "$hostname"
 }
 
 # cf_access_app_create <hostname> <name>: create the self-hosted app, print id.
@@ -377,7 +373,7 @@ cf_access_app_create() {
   body=$(cf_body_access_app "$hostname" "$name")
   cf_request POST "/accounts/$CF_ACCOUNT_ID/access/apps" "$body" || return 2
   cf_check_ok "create Access app for '$hostname'" || return 1
-  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+  cf_extract 'd.get("result",{}).get("id","")'
 }
 
 # cf_access_app_update <app_id> <hostname> <name>
@@ -401,16 +397,15 @@ cf_access_policy_find() {
   local app_id=$1
   cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" || return 2
   cf_check_ok "list Access policies for app $app_id" || return 1
-  python3 -c '
+  printf '%s' "$CF_BODY" | python3 -c '
 import json, sys
-with open(sys.argv[1]) as f:
-    d = json.load(f)
-name = sys.argv[2]
+d = json.load(sys.stdin)
+name = sys.argv[1]
 for p in (d.get("result") or []):
     if p.get("name") == name:
         print(p.get("id",""))
         break
-' "$CF_BODY_FILE" "$FM_TUNNEL_ACCESS_POLICY_NAME"
+' "$FM_TUNNEL_ACCESS_POLICY_NAME"
 }
 
 # cf_access_policy_create <app_id> <email> [<email> ...]: print the policy id.
@@ -421,7 +416,7 @@ cf_access_policy_create() {
   body=$(cf_body_access_policy "$FM_TUNNEL_ACCESS_POLICY_NAME" "$@")
   cf_request POST "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id/policies" "$body" || return 2
   cf_check_ok "create Access policy for app $app_id" || return 1
-  cf_extract "$CF_BODY_FILE" 'd.get("result",{}).get("id","")'
+  cf_extract 'd.get("result",{}).get("id","")'
 }
 
 # cf_access_policy_update <app_id> <policy_id> <email> [<email> ...]
@@ -463,13 +458,22 @@ fm_tunnel_log_path() {
   printf '%s/state/tunnel-%s.%s.log' "$FM_HOME" "$1" "$2"
 }
 
+# fm_tunnel_ensure_cloudflared: cloudflared is never installed without explicit
+# consent, mirroring bootstrap's MISSING:/consent/install convention. A missing
+# binary is a hard failure naming the install command; only an explicit
+# --install-cloudflared (FM_TUNNEL_INSTALL_CLOUDFLARED=1) opts into the install.
 fm_tunnel_ensure_cloudflared() {
   command -v cloudflared >/dev/null 2>&1 && return 0
+  if [ "${FM_TUNNEL_INSTALL_CLOUDFLARED:-0}" != "1" ]; then
+    echo "fm-tunnel: MISSING: cloudflared (install: brew install cloudflared)" >&2
+    echo "fm-tunnel: install it, or re-run 'up' with --install-cloudflared to install it now" >&2
+    return 1
+  fi
   command -v brew >/dev/null 2>&1 || {
     echo "fm-tunnel: cloudflared not found and Homebrew is unavailable to install it" >&2
     return 1
   }
-  echo "fm-tunnel: installing cloudflared via Homebrew" >&2
+  echo "fm-tunnel: installing cloudflared via Homebrew (--install-cloudflared)" >&2
   brew install cloudflared >&2
 }
 

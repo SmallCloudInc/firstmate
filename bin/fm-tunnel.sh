@@ -5,7 +5,8 @@
 #
 # Usage:
 #   fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] \
-#                              [--service <url>] [--emails <e1,e2,...>]
+#                              [--service <url>] [--emails <e1,e2,...>] \
+#                              [--install-cloudflared]
 #   fm-tunnel.sh down <project>
 #   fm-tunnel.sh status <project>
 #   fm-tunnel.sh --help
@@ -35,12 +36,16 @@
 # `down` stops the connector, then deletes the Access policy, Access app, DNS
 # record, and tunnel (in that order so nothing keeps a dangling reference to
 # something already removed), and removes the local token file. Safe to run
-# on a partially-provisioned or already-torn-down project.
+# on a partially-provisioned or already-torn-down project. It exits non-zero,
+# with a summary of what survived, if any lookup or delete failed - so a bad
+# API token never reads as a successful teardown.
 #
-# `status` reports what currently exists without changing anything.
+# `status` reports what currently exists without changing anything, and says
+# "lookup failed" rather than "not found" when Cloudflare could not be queried.
 #
-# Requires: curl, python3 (JSON), cloudflared (auto-installed via Homebrew on
-# `up` if missing), launchctl (macOS).
+# Requires: curl, python3 (JSON), launchctl (macOS), and cloudflared. A missing
+# cloudflared is a hard error naming the install command; pass
+# --install-cloudflared to `up` to opt into installing it via Homebrew.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,18 +55,23 @@ FM_HOME="${FM_HOME:-${FM_ROOT_OVERRIDE:-$FM_ROOT}}"
 . "$SCRIPT_DIR/fm-tunnel-lib.sh"
 
 trap cf_cleanup_tmp EXIT
+trap 'cf_cleanup_tmp; exit 130' INT
+trap 'cf_cleanup_tmp; exit 143' TERM
 
 usage() {
   cat >&2 <<'EOF'
-usage: fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] [--service <url>] [--emails <e1,e2,...>]
+usage: fm-tunnel.sh up <project> [--hostname <host>] [--zone <zone>] [--service <url>] [--emails <e1,e2,...>] [--install-cloudflared]
        fm-tunnel.sh down <project>
        fm-tunnel.sh status <project>
        fm-tunnel.sh --help
 EOF
 }
 
+# Print the header comment block: every line from line 2 up to (not including)
+# the first non-comment line, so the help text cannot drift out of sync with
+# the header's length.
 help() {
-  sed -n '2,40p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,${/^#/!q; s/^# \{0,1\}//; p;}' "$0"
 }
 
 case "${1:-}" in
@@ -113,6 +123,9 @@ while [ $# -gt 0 ]; do
     --emails)
       [ $# -ge 2 ] || { echo "fm-tunnel: --emails requires a value" >&2; exit 2; }
       CLI_EMAILS=$2; shift 2 ;;
+    --install-cloudflared)
+      [ "$CMD" = up ] || { echo "fm-tunnel: --install-cloudflared is only valid for 'up'" >&2; exit 2; }
+      FM_TUNNEL_INSTALL_CLOUDFLARED=1; export FM_TUNNEL_INSTALL_CLOUDFLARED; shift ;;
     *) echo "fm-tunnel: unknown option '$1'" >&2; usage; exit 2 ;;
   esac
 done
@@ -127,9 +140,6 @@ if [ -z "$CF_ACCOUNT_ID" ]; then
   exit 1
 fi
 
-# resolve_or_die <suffix> <cli-value> <var-name-out>: resolve one project
-# setting through fm_tunnel_resolve and die with an actionable message if it
-# is still unset after CLI flag, env var, and config file.
 # resolve_or_die <suffix> <cli-value> <outvar> <flag-name>: resolve one
 # project setting through fm_tunnel_resolve and die with an actionable
 # message if it is still unset after CLI flag, env var, and config file.
@@ -220,6 +230,7 @@ case "$CMD" in
       POLICY_ID=$(cf_access_policy_create "$APP_ID" "${TRIMMED_EMAILS[@]}") || { echo "fm-tunnel: aborting after step 4/6 (Access app done; policy create failed)" >&2; exit 1; }
       echo "fm-tunnel: [5/6] created Access policy allowing: ${TRIMMED_EMAILS[*]}" >&2
     fi
+    [ -n "$POLICY_ID" ] || { echo "fm-tunnel: Cloudflare did not return an Access policy id" >&2; exit 1; }
 
     RUN_TOKEN=$(cf_tunnel_token "$TUNNEL_ID") || { echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector NOT started)" >&2; exit 1; }
     if [ -z "$RUN_TOKEN" ]; then
@@ -254,6 +265,11 @@ case "$CMD" in
     TUNNEL_NAME="firstmate-$PROJECT"
     echo "fm-tunnel: tearing down '$PROJECT'" >&2
 
+    # Every lookup and delete records into SURVIVORS on failure. A failed
+    # lookup is never silently read as "already gone", so an invalid or
+    # under-scoped API token can never report a successful teardown.
+    SURVIVORS=()
+
     fm_tunnel_launchagent_stop "$PROJECT"
     PLIST=$(fm_tunnel_plist_path "$PROJECT")
     rm -f "$PLIST"
@@ -262,76 +278,128 @@ case "$CMD" in
 
     HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
     if [ -n "$HOSTNAME" ]; then
-      APP_ID=$(cf_access_app_find "$HOSTNAME") || true
-      if [ -n "${APP_ID:-}" ]; then
-        POLICY_ID=$(cf_access_policy_find "$APP_ID") || true
-        if [ -n "${POLICY_ID:-}" ]; then
-          cf_access_policy_delete "$APP_ID" "$POLICY_ID" || echo "fm-tunnel: warning: could not delete Access policy $POLICY_ID" >&2
+      if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
+        if [ -n "$APP_ID" ]; then
+          if POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
+            if [ -n "$POLICY_ID" ]; then
+              cf_access_policy_delete "$APP_ID" "$POLICY_ID" || SURVIVORS+=("Access policy $POLICY_ID (delete failed)")
+            fi
+          else
+            SURVIVORS+=("Access policy for app $APP_ID (lookup failed)")
+          fi
+          cf_access_app_delete "$APP_ID" || SURVIVORS+=("Access app $APP_ID (delete failed)")
         fi
-        cf_access_app_delete "$APP_ID" || echo "fm-tunnel: warning: could not delete Access app $APP_ID" >&2
+      else
+        SURVIVORS+=("Access app for '$HOSTNAME' (lookup failed)")
       fi
 
       ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
-        ZONE_ID=$(cf_zone_id "$ZONE") || true
-        if [ -n "${ZONE_ID:-}" ]; then
-          DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME") || true
-          [ -n "${DNS_ID:-}" ] && { cf_dns_delete "$ZONE_ID" "$DNS_ID" || echo "fm-tunnel: warning: could not delete DNS record $DNS_ID" >&2; }
+        if ZONE_ID=$(cf_zone_id "$ZONE"); then
+          if [ -z "$ZONE_ID" ]; then
+            SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not found)")
+          elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
+            if [ -n "$DNS_ID" ]; then
+              cf_dns_delete "$ZONE_ID" "$DNS_ID" || SURVIVORS+=("DNS record $DNS_ID (delete failed)")
+            fi
+          else
+            SURVIVORS+=("DNS record for '$HOSTNAME' (lookup failed)")
+          fi
+        else
+          SURVIVORS+=("DNS record for '$HOSTNAME' (zone lookup failed)")
         fi
+      else
+        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in)")
       fi
     else
-      echo "fm-tunnel: no hostname configured for '$PROJECT' - skipping Access/DNS cleanup (nothing to look up by)" >&2
+      SURVIVORS+=("Access app and DNS record (no hostname configured to look them up by)")
     fi
 
-    TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME") || true
-    if [ -n "${TUNNEL_ID:-}" ]; then
-      cf_tunnel_delete "$TUNNEL_ID" || echo "fm-tunnel: warning: could not delete tunnel $TUNNEL_ID (it may still show an active connection - retry shortly)" >&2
+    if TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME"); then
+      if [ -n "$TUNNEL_ID" ]; then
+        cf_tunnel_delete "$TUNNEL_ID" || SURVIVORS+=("tunnel $TUNNEL_ID (delete failed; an active connection may still be draining - retry shortly)")
+      fi
+    else
+      SURVIVORS+=("tunnel '$TUNNEL_NAME' (lookup failed)")
     fi
 
     rm -f "$(fm_tunnel_token_path "$PROJECT")"
+
+    if [ "${#SURVIVORS[@]}" -gt 0 ]; then
+      echo "fm-tunnel: '$PROJECT' was NOT fully torn down - the local connector is stopped, but these may still be live:" >&2
+      for s in "${SURVIVORS[@]}"; do
+        echo "fm-tunnel:   - $s" >&2
+      done
+      echo "fm-tunnel: fix the cause above and re-run: fm-tunnel.sh down $PROJECT" >&2
+      exit 1
+    fi
     echo "fm-tunnel: '$PROJECT' torn down" >&2
     ;;
 
   status)
     TUNNEL_NAME="firstmate-$PROJECT"
     HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
+    # A failed lookup is reported as such: "not found" is reserved for a
+    # Cloudflare query that actually succeeded and returned nothing, so status
+    # stays trustworthy as a provisioning/teardown check.
+    LOOKUP_FAILED=0
 
-    TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME") || true
-    if [ -n "${TUNNEL_ID:-}" ]; then
-      echo "tunnel:      $TUNNEL_NAME ($TUNNEL_ID)"
+    if TUNNEL_ID=$(cf_tunnel_find "$TUNNEL_NAME"); then
+      if [ -n "$TUNNEL_ID" ]; then
+        echo "tunnel:      $TUNNEL_NAME ($TUNNEL_ID)"
+      else
+        echo "tunnel:      not found"
+      fi
     else
-      echo "tunnel:      not found"
+      LOOKUP_FAILED=1
+      echo "tunnel:      lookup failed (see error above)"
     fi
 
     if [ -n "$HOSTNAME" ]; then
       ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
-        ZONE_ID=$(cf_zone_id "$ZONE") || true
-        if [ -n "${ZONE_ID:-}" ]; then
-          DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME") || true
-          if [ -n "${DNS_ID:-}" ]; then
-            CONTENT=$(cf_dns_current_content "$ZONE_ID" "$DNS_ID") || true
-            echo "dns:         $HOSTNAME -> ${CONTENT:-?}"
+        if ZONE_ID=$(cf_zone_id "$ZONE"); then
+          if [ -z "$ZONE_ID" ]; then
+            echo "dns:         zone '$ZONE' not found"
+          elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
+            if [ -n "$DNS_ID" ]; then
+              if CONTENT=$(cf_dns_current_content "$ZONE_ID" "$DNS_ID"); then
+                echo "dns:         $HOSTNAME -> $CONTENT"
+              else
+                LOOKUP_FAILED=1
+                echo "dns:         $HOSTNAME -> read failed (see error above)"
+              fi
+            else
+              echo "dns:         not found"
+            fi
           else
-            echo "dns:         not found"
+            LOOKUP_FAILED=1
+            echo "dns:         lookup failed (see error above)"
           fi
         else
-          echo "dns:         zone '$ZONE' not found"
+          LOOKUP_FAILED=1
+          echo "dns:         zone lookup failed (see error above)"
         fi
       else
         echo "dns:         zone unknown (no --zone / FM_TUNNEL_*_ZONE configured)"
       fi
 
-      APP_ID=$(cf_access_app_find "$HOSTNAME") || true
-      if [ -n "${APP_ID:-}" ]; then
-        POLICY_ID=$(cf_access_policy_find "$APP_ID") || true
-        if [ -n "${POLICY_ID:-}" ]; then
-          echo "access app:  $HOSTNAME ($APP_ID), policy configured"
+      if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
+        if [ -z "$APP_ID" ]; then
+          echo "access app:  not found"
+        elif POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
+          if [ -n "$POLICY_ID" ]; then
+            echo "access app:  $HOSTNAME ($APP_ID), policy configured"
+          else
+            echo "access app:  $HOSTNAME ($APP_ID), no policy"
+          fi
         else
-          echo "access app:  $HOSTNAME ($APP_ID), no policy"
+          LOOKUP_FAILED=1
+          echo "access app:  $HOSTNAME ($APP_ID), policy lookup failed (see error above)"
         fi
       else
-        echo "access app:  not found"
+        LOOKUP_FAILED=1
+        echo "access app:  lookup failed (see error above)"
       fi
     else
       echo "hostname:    not configured (no --hostname / FM_TUNNEL_*_HOSTNAME) - skipping DNS/Access status"
@@ -346,5 +414,7 @@ case "$CMD" in
     else
       echo "connector:   not installed"
     fi
+
+    [ "$LOOKUP_FAILED" -eq 0 ] || exit 1
     ;;
 esac
