@@ -222,9 +222,9 @@ print(json.dumps({"config": cfg}))
 cf_body_dns_record() {
   python3 -c '
 import json, sys
-hostname, content = sys.argv[1], sys.argv[2]
-print(json.dumps({"name": hostname, "type": "CNAME", "content": content, "proxied": True, "ttl": 1}))
-' "$1" "$2"
+hostname, content, comment = sys.argv[1], sys.argv[2], sys.argv[3]
+print(json.dumps({"name": hostname, "type": "CNAME", "content": content, "proxied": True, "ttl": 1, "comment": comment}))
+' "$1" "$2" "$3"
 }
 
 cf_body_access_app() {
@@ -251,6 +251,18 @@ print(json.dumps({"name": name, "decision": "allow", "include": include, "preced
 # --- resource-level find/create/update helpers ---------------------------------
 
 FM_TUNNEL_ACCESS_POLICY_NAME="firstmate-tunnel-access"
+
+# Ownership markers. Every resource fm-tunnel creates carries one, and no
+# pre-existing resource found by hostname is ever updated or deleted unless it
+# carries this project's marker - so a typo'd hostname cannot clobber an
+# unrelated production DNS record or Access app.
+fm_tunnel_dns_comment() {
+  printf 'managed by firstmate fm-tunnel: %s' "$1"
+}
+
+fm_tunnel_app_name() {
+  printf 'firstmate: %s' "$1"
+}
 
 # cf_tunnel_find <name>: print the id of a non-deleted tunnel with an exact
 # name match, or nothing if none exists.
@@ -330,19 +342,28 @@ cf_dns_current_content() {
   cf_extract 'd.get("result",{}).get("content","")'
 }
 
-# cf_dns_create <zone_id> <hostname> <content>: create the proxied CNAME.
+# cf_dns_current_comment <zone_id> <record_id>: print the record's comment (the
+# ownership marker), or nothing when it has none.
+cf_dns_current_comment() {
+  local zone_id=$1 record_id=$2
+  cf_request GET "/zones/$zone_id/dns_records/$record_id" || return 2
+  cf_check_ok "read DNS record $record_id" || return 1
+  cf_extract 'd.get("result",{}).get("comment") or ""'
+}
+
+# cf_dns_create <zone_id> <hostname> <content> <comment>: create the proxied CNAME.
 cf_dns_create() {
-  local zone_id=$1 hostname=$2 content=$3 body
-  body=$(cf_body_dns_record "$hostname" "$content")
+  local zone_id=$1 hostname=$2 content=$3 comment=$4 body
+  body=$(cf_body_dns_record "$hostname" "$content" "$comment")
   cf_request POST "/zones/$zone_id/dns_records" "$body" || return 2
   cf_check_ok "create DNS record for '$hostname'" || return 1
   cf_extract 'd.get("result",{}).get("id","")'
 }
 
-# cf_dns_update <zone_id> <record_id> <hostname> <content>
+# cf_dns_update <zone_id> <record_id> <hostname> <content> <comment>
 cf_dns_update() {
-  local zone_id=$1 record_id=$2 hostname=$3 content=$4 body
-  body=$(cf_body_dns_record "$hostname" "$content")
+  local zone_id=$1 record_id=$2 hostname=$3 content=$4 comment=$5 body
+  body=$(cf_body_dns_record "$hostname" "$content" "$comment")
   cf_request PUT "/zones/$zone_id/dns_records/$record_id" "$body" || return 2
   cf_check_ok "update DNS record for '$hostname'"
 }
@@ -369,6 +390,15 @@ for a in (d.get("result") or []):
         print(a.get("id",""))
         break
 ' "$hostname"
+}
+
+# cf_access_app_current_name <app_id>: print the app's current name (the
+# ownership marker), or nothing when it has none.
+cf_access_app_current_name() {
+  local app_id=$1
+  cf_request GET "/accounts/$CF_ACCOUNT_ID/access/apps/$app_id" || return 2
+  cf_check_ok "read Access app $app_id" || return 1
+  cf_extract 'd.get("result",{}).get("name") or ""'
 }
 
 # cf_access_app_create <hostname> <name>: create the self-hosted app, print id.
@@ -484,16 +514,27 @@ fm_tunnel_ensure_cloudflared() {
 # fm_tunnel_write_wrapper <project>: write the small script the LaunchAgent
 # execs. Keeping the token out of the plist means it never lands in a
 # world-readable file under ~/Library/LaunchAgents (still visible in `ps` while
-# cloudflared runs, which is unavoidable with the token-run model).
+# cloudflared runs, which is unavoidable with the token-run model). cloudflared
+# is resolved to an absolute path here, because launchd hands the job a minimal
+# PATH that contains neither Homebrew prefix - a bare name would exec-fail into
+# a silent KeepAlive respawn loop while `up` reported success.
 fm_tunnel_write_wrapper() {
-  local project=$1 wrapper token_file
+  local project=$1 wrapper token_file cloudflared_bin
   wrapper=$(fm_tunnel_wrapper_path "$project")
   token_file=$(fm_tunnel_token_path "$project")
+  cloudflared_bin=$(command -v cloudflared) || {
+    echo "fm-tunnel: cloudflared disappeared from PATH" >&2
+    return 1
+  }
+  case "$cloudflared_bin" in
+    /*) : ;;
+    *) cloudflared_bin=$(cd "$(dirname "$cloudflared_bin")" && pwd)/$(basename "$cloudflared_bin") ;;
+  esac
   mkdir -p "$(dirname "$wrapper")" || return 1
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec cloudflared tunnel run --token "\$(cat "$token_file")"
+exec "$cloudflared_bin" tunnel run --token "\$(cat "$token_file")"
 EOF
   chmod 700 "$wrapper"
 }

@@ -18,7 +18,8 @@
 # <PROJECT> is <project> upper-cased with every non [A-Z0-9] character folded
 # to '_' (e.g. project "house-hunter" -> FM_TUNNEL_HOUSE_HUNTER_HOSTNAME).
 # Missing a required setting after all three is a hard error naming exactly
-# what to set.
+# what to set. Those four flags are only valid for `up`; `down` and `status`
+# always act on the configured settings.
 #
 # $FM_HOME/config/cloudflare.env (gitignored) also carries the account-wide
 # CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID. See AGENTS.md for the
@@ -27,6 +28,10 @@
 # `up` is idempotent: every Cloudflare resource is found-by-name/hostname
 # before it is created, so re-running never duplicates a tunnel, DNS record,
 # Access app, or Access policy - existing ones are updated in place instead.
+# Every resource fm-tunnel creates carries an ownership marker (the DNS record's
+# comment, the Access app's name), and neither `up` nor `down` will update or
+# delete a pre-existing record found at the hostname that lacks this project's
+# marker - so a typo'd hostname cannot clobber unrelated production resources.
 # The local connector is a firstmate-owned macOS LaunchAgent
 # (com.firstmate.tunnel.<project>) that execs `cloudflared tunnel run --token
 # ...`; nothing is ever written into projects/. Its run-token is stored
@@ -109,22 +114,29 @@ CLI_HOSTNAME=""
 CLI_ZONE=""
 CLI_SERVICE=""
 CLI_EMAILS=""
+up_only() {
+  [ "$CMD" = up ] || { echo "fm-tunnel: $1 is only valid for 'up'" >&2; exit 2; }
+}
 while [ $# -gt 0 ]; do
   case "$1" in
     --hostname)
+      up_only "$1"
       [ $# -ge 2 ] || { echo "fm-tunnel: --hostname requires a value" >&2; exit 2; }
       CLI_HOSTNAME=$2; shift 2 ;;
     --zone)
+      up_only "$1"
       [ $# -ge 2 ] || { echo "fm-tunnel: --zone requires a value" >&2; exit 2; }
       CLI_ZONE=$2; shift 2 ;;
     --service)
+      up_only "$1"
       [ $# -ge 2 ] || { echo "fm-tunnel: --service requires a value" >&2; exit 2; }
       CLI_SERVICE=$2; shift 2 ;;
     --emails)
+      up_only "$1"
       [ $# -ge 2 ] || { echo "fm-tunnel: --emails requires a value" >&2; exit 2; }
       CLI_EMAILS=$2; shift 2 ;;
     --install-cloudflared)
-      [ "$CMD" = up ] || { echo "fm-tunnel: --install-cloudflared is only valid for 'up'" >&2; exit 2; }
+      up_only "$1"
       FM_TUNNEL_INSTALL_CLOUDFLARED=1; export FM_TUNNEL_INSTALL_CLOUDFLARED; shift ;;
     *) echo "fm-tunnel: unknown option '$1'" >&2; usage; exit 2 ;;
   esac
@@ -204,23 +216,38 @@ case "$CMD" in
       exit 1
     fi
     DNS_CONTENT="$TUNNEL_ID.cfargotunnel.com"
+    DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
     DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS/Access NOT done)" >&2; exit 1; }
     if [ -n "$DNS_ID" ]; then
       CURRENT_CONTENT=$(cf_dns_current_content "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record found but unreadable)" >&2; exit 1; }
-      if [ "$CURRENT_CONTENT" = "$DNS_CONTENT" ]; then
+      CURRENT_COMMENT=$(cf_dns_current_comment "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record found but unreadable)" >&2; exit 1; }
+      if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ] && [ "$CURRENT_CONTENT" != "$DNS_CONTENT" ]; then
+        echo "fm-tunnel: refusing to touch the existing CNAME at '$HOSTNAME' -> $CURRENT_CONTENT" >&2
+        echo "fm-tunnel: it is not managed by fm-tunnel for project '$PROJECT' (expected comment: $DNS_COMMENT)" >&2
+        echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record left untouched)" >&2
+        exit 1
+      fi
+      if [ "$CURRENT_CONTENT" = "$DNS_CONTENT" ] && [ "$CURRENT_COMMENT" = "$DNS_COMMENT" ]; then
         echo "fm-tunnel: [3/6] DNS CNAME already up to date ($HOSTNAME -> $DNS_CONTENT)" >&2
       else
-        cf_dns_update "$ZONE_ID" "$DNS_ID" "$HOSTNAME" "$DNS_CONTENT" || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS update failed)" >&2; exit 1; }
+        cf_dns_update "$ZONE_ID" "$DNS_ID" "$HOSTNAME" "$DNS_CONTENT" "$DNS_COMMENT" || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS update failed)" >&2; exit 1; }
         echo "fm-tunnel: [3/6] updated DNS CNAME: $HOSTNAME -> $DNS_CONTENT" >&2
       fi
     else
-      DNS_ID=$(cf_dns_create "$ZONE_ID" "$HOSTNAME" "$DNS_CONTENT") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS create failed)" >&2; exit 1; }
+      DNS_ID=$(cf_dns_create "$ZONE_ID" "$HOSTNAME" "$DNS_CONTENT" "$DNS_COMMENT") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS create failed)" >&2; exit 1; }
       echo "fm-tunnel: [3/6] created DNS CNAME: $HOSTNAME -> $DNS_CONTENT" >&2
     fi
 
     APP_ID=$(cf_access_app_find "$HOSTNAME") || { echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access NOT done)" >&2; exit 1; }
-    APP_NAME="firstmate: $PROJECT"
+    APP_NAME=$(fm_tunnel_app_name "$PROJECT")
     if [ -n "$APP_ID" ]; then
+      CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID") || { echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access app found but unreadable)" >&2; exit 1; }
+      if [ "$CURRENT_APP_NAME" != "$APP_NAME" ]; then
+        echo "fm-tunnel: refusing to touch the existing Access app on '$HOSTNAME' named '$CURRENT_APP_NAME'" >&2
+        echo "fm-tunnel: it is not managed by fm-tunnel for project '$PROJECT' (expected name: $APP_NAME)" >&2
+        echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access app left untouched)" >&2
+        exit 1
+      fi
       cf_access_app_update "$APP_ID" "$HOSTNAME" "$APP_NAME" || { echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access app update failed)" >&2; exit 1; }
       echo "fm-tunnel: [4/6] Access app already exists ($APP_ID), updated" >&2
     else
@@ -276,30 +303,47 @@ case "$CMD" in
     # lookup is never silently read as "already gone", so an invalid or
     # under-scoped API token can never report a successful teardown.
     SURVIVORS=()
+    CONNECTOR_STOPPED=1
 
     fm_tunnel_launchagent_stop "$PROJECT"
     PLIST=$(fm_tunnel_plist_path "$PROJECT")
-    rm -f "$PLIST"
-    rm -f "$(fm_tunnel_wrapper_path "$PROJECT")"
-    echo "fm-tunnel: connector stopped and LaunchAgent removed" >&2
+    if fm_tunnel_launchagent_alive "$PROJECT"; then
+      # The plist and wrapper are kept, because removing them would leave a live
+      # cloudflared with no way for a later `down` to unload it by path.
+      CONNECTOR_STOPPED=0
+      SURVIVORS+=("connector $(fm_tunnel_label "$PROJECT") (still running; LaunchAgent could not be unloaded)")
+      echo "fm-tunnel: connector could NOT be stopped - LaunchAgent left in place" >&2
+    else
+      rm -f "$PLIST"
+      rm -f "$(fm_tunnel_wrapper_path "$PROJECT")"
+      echo "fm-tunnel: connector stopped and LaunchAgent removed" >&2
+    fi
 
+    APP_NAME=$(fm_tunnel_app_name "$PROJECT")
+    DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
     HOSTNAME=$(fm_tunnel_resolve "$PROJECT" HOSTNAME "" 2>/dev/null || true)
     if [ -n "$HOSTNAME" ]; then
       if APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -n "$APP_ID" ]; then
-          # Deleting the Access app removes its policies with it, so a policy
-          # problem only survives when the app delete also fails.
-          POLICY_SURVIVOR=""
-          if POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
-            if [ -n "$POLICY_ID" ]; then
-              cf_access_policy_delete "$APP_ID" "$POLICY_ID" || POLICY_SURVIVOR="Access policy $POLICY_ID (delete failed)"
-            fi
+          if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then
+            SURVIVORS+=("Access app $APP_ID (read failed; left untouched)")
+          elif [ "$CURRENT_APP_NAME" != "$APP_NAME" ]; then
+            SURVIVORS+=("Access app $APP_ID named '$CURRENT_APP_NAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
           else
-            POLICY_SURVIVOR="Access policy for app $APP_ID (lookup failed)"
-          fi
-          if ! cf_access_app_delete "$APP_ID"; then
-            SURVIVORS+=("Access app $APP_ID (delete failed)")
-            [ -n "$POLICY_SURVIVOR" ] && SURVIVORS+=("$POLICY_SURVIVOR")
+            # Deleting the Access app removes its policies with it, so a policy
+            # problem only survives when the app delete also fails.
+            POLICY_SURVIVOR=""
+            if POLICY_ID=$(cf_access_policy_find "$APP_ID"); then
+              if [ -n "$POLICY_ID" ]; then
+                cf_access_policy_delete "$APP_ID" "$POLICY_ID" || POLICY_SURVIVOR="Access policy $POLICY_ID (delete failed)"
+              fi
+            else
+              POLICY_SURVIVOR="Access policy for app $APP_ID (lookup failed)"
+            fi
+            if ! cf_access_app_delete "$APP_ID"; then
+              SURVIVORS+=("Access app $APP_ID (delete failed)")
+              [ -n "$POLICY_SURVIVOR" ] && SURVIVORS+=("$POLICY_SURVIVOR")
+            fi
           fi
         fi
       else
@@ -313,7 +357,13 @@ case "$CMD" in
             SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not found)")
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -n "$DNS_ID" ]; then
-              cf_dns_delete "$ZONE_ID" "$DNS_ID" || SURVIVORS+=("DNS record $DNS_ID (delete failed)")
+              if ! CURRENT_COMMENT=$(cf_dns_current_comment "$ZONE_ID" "$DNS_ID"); then
+                SURVIVORS+=("DNS record $DNS_ID (read failed; left untouched)")
+              elif [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
+                SURVIVORS+=("DNS record $DNS_ID for '$HOSTNAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
+              else
+                cf_dns_delete "$ZONE_ID" "$DNS_ID" || SURVIVORS+=("DNS record $DNS_ID (delete failed)")
+              fi
             fi
           else
             SURVIVORS+=("DNS record for '$HOSTNAME' (lookup failed)")
@@ -336,10 +386,12 @@ case "$CMD" in
       SURVIVORS+=("tunnel '$TUNNEL_NAME' (lookup failed)")
     fi
 
-    rm -f "$(fm_tunnel_token_path "$PROJECT")"
+    # A still-running connector needs its token file; removing it would only
+    # break the restart the operator has to perform anyway.
+    [ "$CONNECTOR_STOPPED" -eq 1 ] && rm -f "$(fm_tunnel_token_path "$PROJECT")"
 
     if [ "${#SURVIVORS[@]}" -gt 0 ]; then
-      echo "fm-tunnel: '$PROJECT' was NOT fully torn down - the local connector is stopped, but these may still be live:" >&2
+      echo "fm-tunnel: '$PROJECT' was NOT fully torn down - these may still be live:" >&2
       for s in "${SURVIVORS[@]}"; do
         echo "fm-tunnel:   - $s" >&2
       done
