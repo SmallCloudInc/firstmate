@@ -33,10 +33,11 @@
 # delete a pre-existing record found at the hostname that lacks this project's
 # marker - so a typo'd hostname cannot clobber unrelated production resources.
 # The local connector is a firstmate-owned macOS LaunchAgent
-# (com.firstmate.tunnel.<project>) that execs `cloudflared tunnel run --token
-# ...`; nothing is ever written into projects/. Its run-token is stored
-# gitignored at $FM_HOME/config/tunnel-<project>.token (0600) and is never
-# printed to stdout/stderr/logs.
+# (com.firstmate.tunnel.<project>) that execs `cloudflared tunnel run` with the
+# run-token passed through the TUNNEL_TOKEN environment variable, so it never
+# appears in the process argv; nothing is ever written into projects/. The
+# token is stored gitignored at $FM_HOME/config/tunnel-<project>.token (0600)
+# and is never printed to stdout/stderr/logs.
 #
 # `down` stops the connector, then deletes the Access policy, Access app, DNS
 # record, and tunnel (in that order so nothing keeps a dangling reference to
@@ -241,9 +242,16 @@ case "$CMD" in
         echo "fm-tunnel: [3/6] updated DNS CNAME: $HOSTNAME -> $DNS_CONTENT" >&2
       fi
     else
-      DNS_ID=$(cf_dns_create "$ZONE_ID" "$HOSTNAME" "$DNS_CONTENT" "$DNS_COMMENT") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS create failed)" >&2; exit 1; }
+      DNS_ID=$(cf_dns_create "$ZONE_ID" "$HOSTNAME" "$DNS_CONTENT" "$DNS_COMMENT") || {
+        echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; a CNAME at '$HOSTNAME' may have been created; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        exit 1
+      }
       echo "fm-tunnel: [3/6] created DNS CNAME: $HOSTNAME -> $DNS_CONTENT" >&2
     fi
+    [ -n "$DNS_ID" ] || {
+      echo "fm-tunnel: Cloudflare did not return a DNS record id - a CNAME at '$HOSTNAME' may exist; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      exit 1
+    }
 
     APP_ID=$(cf_access_app_find "$HOSTNAME") || { echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access NOT done)" >&2; exit 1; }
     APP_NAME=$(fm_tunnel_app_name "$PROJECT")
@@ -311,6 +319,7 @@ case "$CMD" in
     done
     if [ "$CONNECTOR_UP" -eq 0 ]; then
       echo "fm-tunnel: connector did not stay up - see $(fm_tunnel_log_path "$PROJECT" err)" >&2
+      echo "fm-tunnel: the LaunchAgent $(fm_tunnel_label "$PROJECT") IS loaded and launchd keeps respawning it in the background; run 'fm-tunnel.sh down $PROJECT' to stop it" >&2
       echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector not running)" >&2
       exit 1
     fi
@@ -502,14 +511,14 @@ case "$CMD" in
       echo "hostname:    not configured (no --hostname / FM_TUNNEL_*_HOSTNAME) - skipping DNS/Access status"
     fi
 
-    if [ -f "$(fm_tunnel_plist_path "$PROJECT")" ]; then
+    if fm_tunnel_launchagent_loaded "$PROJECT"; then
       if fm_tunnel_launchagent_alive "$PROJECT"; then
         echo "connector:   LaunchAgent loaded and running ($(fm_tunnel_label "$PROJECT"))"
       else
-        echo "connector:   LaunchAgent installed but not running ($(fm_tunnel_label "$PROJECT"))"
+        echo "connector:   LaunchAgent loaded but not running ($(fm_tunnel_label "$PROJECT"))"
       fi
     else
-      echo "connector:   not installed"
+      echo "connector:   not loaded"
     fi
 
     [ "$LOOKUP_FAILED" -eq 0 ] || exit 1
