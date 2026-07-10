@@ -53,25 +53,28 @@
 # `down` stops the connector, then deletes the DNS record, the Access policy
 # and its Access app, and the tunnel (in that order: the public route goes
 # first, so a partial failure can never leave the hostname resolvable with its
-# login gate already removed). If an fm-tunnel-owned DNS record may still be
-# live - a record read failure, a zone or record lookup failure, a failed
-# delete, or no zone to look the record up in - the Access app and its policy
-# are deliberately left alive and reported as survivors rather than deleted out
-# from under a possibly-resolvable hostname; the gate goes only once the absence
-# of an fm-tunnel-owned route is confirmed, never on the assumption that none was
-# created. A record that is not fm-tunnel's, or a zone that does not exist,
-# routes nothing to this tunnel, so fm-tunnel's own Access app is still removed
-# in those cases (the foreign record is reported untouched, and a nonexistent
-# zone is reported as an informational note rather than a survivor). When the
-# hostname or zone is simply not configured, re-run with `--hostname <host>`
-# and/or `--zone <zone>` to finish the teardown. It removes the local token
-# file too. Safe to run on a partially-provisioned or
-# already-torn-down project. It exits non-zero, with a summary of what survived,
-# if any lookup or delete failed - so a bad API token never reads as a
-# successful teardown.
+# login gate already removed). The Access app and its policy are deleted only
+# once an unambiguous Cloudflare read has confirmed that no fm-tunnel-owned
+# route to this hostname survives: the record was deleted, or the lookup
+# succeeded and found none, or the record found there is foreign (and so routes
+# nothing to this tunnel; it is reported untouched). Every other outcome - a
+# zone or record lookup failure, an empty zone list (the zone may simply be
+# invisible to an under-scoped token), a record read failure, a failed delete,
+# or no hostname/zone configured to look the record up by - leaves the record's
+# state unconfirmed, so the gate is deliberately left alive and reported as a
+# survivor rather than deleted out from under a possibly-resolvable hostname.
+# The gate goes only once the absence of an fm-tunnel-owned route is confirmed,
+# never on the assumption that none was created. When the hostname or zone is
+# simply not configured, re-run with `--hostname <host>` and/or `--zone <zone>`
+# to finish the teardown. It removes the local token file too. Safe to run on a
+# partially-provisioned or already-torn-down project. It exits non-zero, with a
+# summary of what survived, if any lookup or delete failed - so a bad API token
+# never reads as a successful teardown.
 #
-# `status` reports what currently exists without changing anything, and says
-# "lookup failed" rather than "not found" when Cloudflare could not be queried.
+# `status` reports what currently exists without changing anything, says
+# "lookup failed" rather than "not found" when Cloudflare could not be queried,
+# and attributes a DNS record or Access app to this project only when it carries
+# this project's ownership marker.
 #
 # Requires: curl, python3 (JSON), launchctl (macOS), and cloudflared. A missing
 # cloudflared is a hard error naming the install command; pass
@@ -409,19 +412,22 @@ case "$CMD" in
       # The DNS record goes first: it is the public route. The Access gate is
       # only removed once no fm-tunnel-owned route into this tunnel can still be
       # live, so no partial failure can leave the service reachable with its
-      # login gate already deleted. A record that is not ours - or a zone that
-      # does not exist - routes nothing here, so it never holds the gate hostage.
-      # The gate is only ever removed once the absence of our route has actually
-      # been confirmed, never on an assumption that none was created.
+      # login gate already deleted. Only a successful, unambiguous read licenses
+      # that removal: a record confirmed absent, or one confirmed foreign (it
+      # routes nothing here), or one of ours confirmed deleted. Every other
+      # outcome - a failed lookup, an unreadable record, a failed delete, a zone
+      # the token cannot see, no zone configured - is unconfirmed, and the gate
+      # stays, never removed on an assumption that no route was created.
       OUR_ROUTE_MAY_BE_LIVE=1
       ZONE=$(fm_tunnel_resolve "$PROJECT" ZONE "$CLI_ZONE" 2>/dev/null || true)
       if [ -n "$ZONE" ]; then
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
-            # A zone that does not exist can hold no record, so there is no
-            # route of ours here and nothing survived.
-            OUR_ROUTE_MAY_BE_LIVE=0
-            echo "fm-tunnel: zone '$ZONE' not found - no DNS record for '$HOSTNAME' can exist in it" >&2
+            # An empty zone list is ambiguous: the zone may not exist, or the
+            # API token may lack Zone:Read for it (Cloudflare answers 200 with
+            # an empty result), or the zone name may be a typo. In the latter
+            # two the real record is still live, so this is unconfirmed.
+            SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not visible to this API token; state unconfirmed - check the zone name and the token's Zone:Read scope, or pass --zone <zone>, then re-run: fm-tunnel.sh down $PROJECT)")
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -z "$DNS_ID" ]; then
               OUR_ROUTE_MAY_BE_LIVE=0
@@ -530,11 +536,16 @@ case "$CMD" in
         if ZONE_ID=$(cf_zone_id "$ZONE"); then
           if [ -z "$ZONE_ID" ]; then
             LOOKUP_FAILED=1
-            echo "dns:         zone '$ZONE' not found"
+            echo "dns:         zone '$ZONE' not visible to this API token (check the zone name and the token's Zone:Read scope)"
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -n "$DNS_ID" ]; then
               if RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID"); then
-                echo "dns:         $HOSTNAME -> ${RECORD%%$'\t'*}"
+                DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
+                if [ "${RECORD#*$'\t'}" = "$DNS_COMMENT" ]; then
+                  echo "dns:         $HOSTNAME -> ${RECORD%%$'\t'*}"
+                else
+                  echo "dns:         $HOSTNAME -> ${RECORD%%$'\t'*} - not managed by fm-tunnel for '$PROJECT'"
+                fi
               else
                 LOOKUP_FAILED=1
                 echo "dns:         $HOSTNAME -> read failed (see error above)"

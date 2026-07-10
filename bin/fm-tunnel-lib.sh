@@ -42,18 +42,31 @@ cf_cleanup_tmp() {
 
 # fm_tunnel_env_get <key> <file>: read the last KEY=VALUE assignment from a
 # .env-style file (tolerates "export ", surrounding whitespace, one layer of
-# quoting). Prints nothing (and succeeds) when the file or key is absent.
+# quoting, and a trailing ` # comment` on an unquoted value, exactly as a
+# shell-sourced .env would). Prints nothing (and succeeds) when the file or key
+# is absent.
 fm_tunnel_env_get() {
-  local key=$1 file=$2 line val
+  local key=$1 file=$2 line val rest
   [ -f "$file" ] || return 0
   line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null | tail -n1) || return 0
   [ -n "$line" ] || return 0
   val=${line#*=}
   val=${val#"${val%%[![:space:]]*}"}
-  val=${val%"${val##*[![:space:]]}"}
   case "$val" in
-    \"*\") val=${val#\"}; val=${val%\"} ;;
-    \'*\') val=${val#\'}; val=${val%\'} ;;
+    \"*)
+      rest=${val#\"}
+      case "$rest" in *\"*) val=${rest%%\"*} ;; *) val=$rest ;; esac
+      ;;
+    \'*)
+      rest=${val#\'}
+      case "$rest" in *\'*) val=${rest%%\'*} ;; *) val=$rest ;; esac
+      ;;
+    *)
+      case "$val" in
+        *[[:space:]]\#*) val=${val%%[[:space:]]\#*} ;;
+      esac
+      val=${val%"${val##*[![:space:]]}"}
+      ;;
   esac
   printf '%s' "$val"
 }
