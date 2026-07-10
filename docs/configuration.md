@@ -110,6 +110,7 @@ Secondmate homes inherit this file from the primary, so a secondmate's own crewm
 On session start the first mate detects what its required toolchain is missing or too old (tmux, node, gh, treehouse with durable lease support, no-mistakes v1.31.2 or newer, gh-axi, chrome-devtools-axi, lavish-axi), lists it with the exact install commands, and installs only after you say go.
 When `config/crew-dispatch.json` exists, bootstrap also requires `jq` for dispatch profile validation.
 When X mode is opted in, bootstrap also requires `curl` and `jq` before arming the relay poll shim.
+`bin/fm-tunnel.sh` has its own toolchain, checked at invocation rather than by bootstrap: `curl`, `python3`, `launchctl`, and `cloudflared`.
 Unless `config/backlog-backend=manual`, bootstrap treats `tasks-axi` as the default backlog backend.
 If compatible `tasks-axi` is already on `PATH`, bootstrap records it as `TASKS_AXI: available` and firstmate uses its verbs for routine backlog mutations.
 When it is absent or incompatible, bootstrap reports `MISSING: tasks-axi (install: npm install -g tasks-axi)` and firstmate keeps hand-editing `data/backlog.md` until installation is approved and completed.
@@ -180,6 +181,27 @@ Slice 1 shipped the bridge, outbound escalations, dry-run, and health checking.
 Slice 2 makes the channel always-on and two-way: bootstrap wires inbound messages into the existing watcher check mechanism (`state/spectrum-watch.check.sh`, `config/spectrum-mode.env` at a 20s cadence), the agent-only `spectrum-respond` skill drains and acts on them, `fm-spectrum-ensure-bridge.sh` keeps the bridge process itself always running (idempotent start/restart, single-instance locked), and `fm-spectrum-escalate.sh` auto-pushes captain-facing escalations to the channel when the captain is away (`state/.afk`).
 Full detail lives in [docs/spectrum-backend.md](spectrum-backend.md).
 
+## Local tunnels (config/cloudflare.env)
+
+`bin/fm-tunnel.sh` exposes a locally-running project on one of the captain's own domains behind a Cloudflare Access email login gate, without opening a port.
+It is inert until the firstmate home's gitignored `config/cloudflare.env` carries the account-wide `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` plus one `FM_TUNNEL_<PROJECT>_` block per project.
+`<PROJECT>` is the project id from the command line, upper-cased with every character outside `[A-Z0-9]` folded to `_`, so project `house-hunter` reads `FM_TUNNEL_HOUSE_HUNTER_HOSTNAME`, `_ZONE`, `_SERVICE`, and `_ACCESS_EMAILS`.
+`ACCESS_EMAILS` is a comma-separated allow list for the Cloudflare Access One-Time-PIN login.
+Each of hostname, zone, service, and emails resolves through the matching CLI flag, then a real process environment variable of that name, then the config file; a setting still unset after all three is a hard error naming exactly what to set.
+See [`docs/examples/cloudflare.env`](examples/cloudflare.env) for a starting point to copy into local `config/cloudflare.env`.
+
+The required Cloudflare API token scopes are account-scoped: Cloudflare Tunnel:Edit, DNS:Edit, Access: Apps and Policies:Edit, the paired Read permissions Cloudflare requires alongside each Edit scope, and Zone:Read for zone lookup.
+`up` is idempotent and provisions in order - tunnel `firstmate-<project>`, ingress, Access app, its `firstmate-tunnel-access` allow-policy, DNS CNAME, run-token, LaunchAgent - so a public route never exists before the login gate that fronts it.
+Every created resource carries an ownership marker (the DNS record's `comment`, the Access app's name): `up` and `down` refuse to update or delete an unmarked resource found at the hostname, and `status` labels one as unmanaged rather than attributing it to the project.
+`--hostname` and `--zone` are accepted by all three commands so an ad-hoc provision can still be torn down or inspected; `--service`, `--emails`, and `--install-cloudflared` are creation-time settings that only `up` accepts.
+
+The connector runs as a firstmate-owned macOS LaunchAgent labelled `com.firstmate.tunnel.<project>`, never from inside a project worktree.
+Its run-token lives at `config/tunnel-<project>.token` (0600, never printed), its wrapper at `config/tunnel-<project>-run.sh`, and its output at `state/tunnel-<project>.out.log` and `state/tunnel-<project>.err.log`.
+A re-run whose token, wrapper, and plist are byte-identical with a live connector pid skips the LaunchAgent bounce entirely, so an idempotent `up` never drops a live tunnel.
+`fm-tunnel.sh` needs `curl` and `python3` for every command, and `up` additionally needs `launchctl` and `cloudflared`; that connector toolchain is checked before the first Cloudflare API call, so a host missing either tool fails with zero cloud resources created.
+A missing `cloudflared` is a hard error naming `brew install cloudflared`, mirroring bootstrap's MISSING/consent/install convention; pass `--install-cloudflared` to `up` to opt into installing it via Homebrew.
+Full behavior, including the teardown ordering and the unconfirmed-lookup survivor rules, lives in [AGENTS.md section 15](../AGENTS.md#15-local-tunnels-cloudflare).
+
 ## Environment variables
 
 Runtime tuning via environment variables (defaults shown):
@@ -216,6 +238,16 @@ SPECTRUM_TARGET_HANDLE=   # optional override of the default outbound target (ot
 SPECTRUM_DRY_RUN=       # truthy previews outbound sends to state/spectrum-outbox/ without a live account or bridge
 SPECTRUM_ENV_FILE=      # optional alternate .env file for direct spectrum client invocations (testing)
 SPECTRUM_BRIDGE_STALE_SECS=90   # seconds before fm-spectrum-status.sh calls the bridge liveness beacon stale
+CLOUDFLARE_API_TOKEN=   # fm-tunnel Cloudflare API token; environment wins over config/cloudflare.env
+CLOUDFLARE_ACCOUNT_ID=  # fm-tunnel Cloudflare account id; environment wins over config/cloudflare.env
+FM_TUNNEL_<PROJECT>_HOSTNAME=       # per-project public hostname; overridden by --hostname, overrides config/cloudflare.env
+FM_TUNNEL_<PROJECT>_ZONE=           # per-project Cloudflare zone; overridden by --zone
+FM_TUNNEL_<PROJECT>_SERVICE=        # per-project local origin URL, e.g. http://localhost:8765; overridden by --service
+FM_TUNNEL_<PROJECT>_ACCESS_EMAILS=  # per-project comma-separated Access allow list; overridden by --emails
+FM_TUNNEL_CONFIG_FILE=  # alternate fm-tunnel config file; defaults to $FM_HOME/config/cloudflare.env
+FM_TUNNEL_INSTALL_CLOUDFLARED=0   # set by --install-cloudflared; 1 opts into installing cloudflared via Homebrew
+FM_TUNNEL_HOME_DIR=     # alternate home dir holding Library/LaunchAgents, mainly for tests
+CF_API_BASE=https://api.cloudflare.com/client/v4   # fm-tunnel Cloudflare API base, mainly for tests
 FM_LOCK_STALE_AFTER=2   # seconds before dead-pid lock records can be reclaimed; mid-acquire locks keep at least 2s grace
 FM_GUARD_GRACE=300      # seconds before guard warnings and arm health checks treat a watcher beacon as stale
 FM_ARM_CONFIRM_TIMEOUT=10   # seconds fm-watch-arm waits to confirm a fresh watcher before reporting FAILED
