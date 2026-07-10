@@ -503,7 +503,7 @@ fm_tunnel_ensure_cloudflared() {
   brew install cloudflared >&2
 }
 
-# fm_tunnel_write_wrapper <project>: write the small script the LaunchAgent
+# fm_tunnel_render_wrapper <project>: print the small script the LaunchAgent
 # execs. Keeping the token out of the plist means it never lands in a
 # world-readable file under ~/Library/LaunchAgents, and passing it through
 # a shell environment assignment (never `env`, whose own argv would carry the
@@ -512,9 +512,8 @@ fm_tunnel_ensure_cloudflared() {
 # is resolved to an absolute path here, because launchd hands the job a minimal
 # PATH that contains neither Homebrew prefix - a bare name would exec-fail into
 # a silent KeepAlive respawn loop while `up` reported success.
-fm_tunnel_write_wrapper() {
-  local project=$1 wrapper token_file cloudflared_bin
-  wrapper=$(fm_tunnel_wrapper_path "$project")
+fm_tunnel_render_wrapper() {
+  local project=$1 token_file cloudflared_bin
   token_file=$(fm_tunnel_token_path "$project")
   cloudflared_bin=$(command -v cloudflared) || {
     echo "fm-tunnel: cloudflared disappeared from PATH" >&2
@@ -524,25 +523,31 @@ fm_tunnel_write_wrapper() {
     /*) : ;;
     *) cloudflared_bin=$(cd "$(dirname "$cloudflared_bin")" && pwd)/$(basename "$cloudflared_bin") ;;
   esac
-  mkdir -p "$(dirname "$wrapper")" || return 1
-  cat > "$wrapper" <<EOF
+  cat <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 TUNNEL_TOKEN="\$(cat "$token_file")" exec "$cloudflared_bin" tunnel run
 EOF
+}
+
+# fm_tunnel_write_wrapper <project>: write that script to disk.
+fm_tunnel_write_wrapper() {
+  local project=$1 wrapper content
+  wrapper=$(fm_tunnel_wrapper_path "$project")
+  content=$(fm_tunnel_render_wrapper "$project") || return 1
+  mkdir -p "$(dirname "$wrapper")" || return 1
+  printf '%s\n' "$content" > "$wrapper" || return 1
   chmod 700 "$wrapper"
 }
 
-# fm_tunnel_write_plist <project>: write the LaunchAgent plist.
-fm_tunnel_write_plist() {
-  local project=$1 plist label wrapper out_log err_log
-  plist=$(fm_tunnel_plist_path "$project")
+# fm_tunnel_render_plist <project>: print the LaunchAgent plist.
+fm_tunnel_render_plist() {
+  local project=$1 label wrapper out_log err_log
   label=$(fm_tunnel_label "$project")
   wrapper=$(fm_tunnel_wrapper_path "$project")
   out_log=$(fm_tunnel_log_path "$project" out)
   err_log=$(fm_tunnel_log_path "$project" err)
-  mkdir -p "$(dirname "$plist")" "$(dirname "$out_log")" || return 1
-  cat > "$plist" <<EOF
+  cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -564,6 +569,35 @@ fm_tunnel_write_plist() {
 </dict>
 </plist>
 EOF
+}
+
+# fm_tunnel_write_plist <project>: write that plist to disk.
+fm_tunnel_write_plist() {
+  local project=$1 plist content out_log
+  plist=$(fm_tunnel_plist_path "$project")
+  out_log=$(fm_tunnel_log_path "$project" out)
+  content=$(fm_tunnel_render_plist "$project") || return 1
+  mkdir -p "$(dirname "$plist")" "$(dirname "$out_log")" || return 1
+  printf '%s\n' "$content" > "$plist"
+}
+
+# fm_tunnel_connector_unchanged <project> <run-token>: succeed when the token
+# file, wrapper, and plist already on disk are byte-identical to what `up`
+# would write, and the connector is alive. Lets an idempotent `up` skip the
+# unload/reload bounce, which would otherwise drop a live tunnel for the
+# duration of the cloudflared restart.
+fm_tunnel_connector_unchanged() {
+  local project=$1 run_token=$2 token_file wrapper plist want
+  token_file=$(fm_tunnel_token_path "$project")
+  wrapper=$(fm_tunnel_wrapper_path "$project")
+  plist=$(fm_tunnel_plist_path "$project")
+  [ -f "$token_file" ] && [ -f "$wrapper" ] && [ -f "$plist" ] || return 1
+  [ "$(cat "$token_file")" = "$run_token" ] || return 1
+  want=$(fm_tunnel_render_wrapper "$project") || return 1
+  [ "$(cat "$wrapper")" = "$want" ] || return 1
+  want=$(fm_tunnel_render_plist "$project") || return 1
+  [ "$(cat "$plist")" = "$want" ] || return 1
+  fm_tunnel_launchagent_alive "$project"
 }
 
 # fm_tunnel_launchagent_start <project>: (re)load the LaunchAgent so it picks

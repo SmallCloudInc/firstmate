@@ -150,6 +150,17 @@ for tool in curl python3; do
   }
 done
 
+# `up` needs the local connector toolchain too. Check it (and run the opt-in
+# Homebrew install) before the first Cloudflare request, so a host without
+# cloudflared fails with zero cloud resources created rather than after five.
+if [ "$CMD" = up ]; then
+  command -v launchctl >/dev/null 2>&1 || {
+    echo "fm-tunnel: launchctl not found on PATH (required to run the connector)" >&2
+    exit 1
+  }
+  fm_tunnel_ensure_cloudflared || exit 1
+fi
+
 fm_tunnel_load_config
 if [ -z "$CF_TOKEN" ]; then
   echo "fm-tunnel: no CLOUDFLARE_API_TOKEN (set it in $FM_TUNNEL_CONFIG_FILE_RESOLVED or the environment)" >&2
@@ -299,31 +310,33 @@ case "$CMD" in
       exit 1
     fi
 
-    fm_tunnel_ensure_cloudflared || { echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector NOT started)" >&2; exit 1; }
+    if fm_tunnel_connector_unchanged "$PROJECT" "$RUN_TOKEN"; then
+      echo "fm-tunnel: [6/6] connector already running unchanged ($(fm_tunnel_label "$PROJECT"))" >&2
+    else
+      TOKEN_FILE=$(fm_tunnel_token_path "$PROJECT")
+      mkdir -p "$(dirname "$TOKEN_FILE")" || { echo "fm-tunnel: cannot create $(dirname "$TOKEN_FILE")" >&2; exit 1; }
+      ( umask 077; printf '%s' "$RUN_TOKEN" > "$TOKEN_FILE" ) || { echo "fm-tunnel: cannot write token file" >&2; exit 1; }
+      chmod 600 "$TOKEN_FILE" 2>/dev/null || true
 
-    TOKEN_FILE=$(fm_tunnel_token_path "$PROJECT")
-    mkdir -p "$(dirname "$TOKEN_FILE")" || { echo "fm-tunnel: cannot create $(dirname "$TOKEN_FILE")" >&2; exit 1; }
-    ( umask 077; printf '%s' "$RUN_TOKEN" > "$TOKEN_FILE" ) || { echo "fm-tunnel: cannot write token file" >&2; exit 1; }
-    chmod 600 "$TOKEN_FILE" 2>/dev/null || true
-
-    fm_tunnel_write_wrapper "$PROJECT" || { echo "fm-tunnel: cannot write connector wrapper script" >&2; exit 1; }
-    fm_tunnel_write_plist "$PROJECT" || { echo "fm-tunnel: cannot write LaunchAgent plist" >&2; exit 1; }
-    if ! fm_tunnel_launchagent_start "$PROJECT"; then
-      echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector failed to start - retry with: fm-tunnel.sh up $PROJECT)" >&2
-      exit 1
+      fm_tunnel_write_wrapper "$PROJECT" || { echo "fm-tunnel: cannot write connector wrapper script" >&2; exit 1; }
+      fm_tunnel_write_plist "$PROJECT" || { echo "fm-tunnel: cannot write LaunchAgent plist" >&2; exit 1; }
+      if ! fm_tunnel_launchagent_start "$PROJECT"; then
+        echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector failed to start - retry with: fm-tunnel.sh up $PROJECT)" >&2
+        exit 1
+      fi
+      CONNECTOR_UP=0
+      for _ in 1 2 3 4; do
+        if fm_tunnel_launchagent_alive "$PROJECT"; then CONNECTOR_UP=1; break; fi
+        sleep 0.5
+      done
+      if [ "$CONNECTOR_UP" -eq 0 ]; then
+        echo "fm-tunnel: connector did not stay up - see $(fm_tunnel_log_path "$PROJECT" err)" >&2
+        echo "fm-tunnel: the LaunchAgent $(fm_tunnel_label "$PROJECT") IS loaded and launchd keeps respawning it in the background; run 'fm-tunnel.sh down $PROJECT' to stop it" >&2
+        echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector not running)" >&2
+        exit 1
+      fi
+      echo "fm-tunnel: [6/6] connector LaunchAgent installed and started ($(fm_tunnel_label "$PROJECT"))" >&2
     fi
-    CONNECTOR_UP=0
-    for _ in 1 2 3 4; do
-      if fm_tunnel_launchagent_alive "$PROJECT"; then CONNECTOR_UP=1; break; fi
-      sleep 0.5
-    done
-    if [ "$CONNECTOR_UP" -eq 0 ]; then
-      echo "fm-tunnel: connector did not stay up - see $(fm_tunnel_log_path "$PROJECT" err)" >&2
-      echo "fm-tunnel: the LaunchAgent $(fm_tunnel_label "$PROJECT") IS loaded and launchd keeps respawning it in the background; run 'fm-tunnel.sh down $PROJECT' to stop it" >&2
-      echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector not running)" >&2
-      exit 1
-    fi
-    echo "fm-tunnel: [6/6] connector LaunchAgent installed and started ($(fm_tunnel_label "$PROJECT"))" >&2
 
     echo ""
     echo "fm-tunnel: '$PROJECT' is live at https://$HOSTNAME"
@@ -346,8 +359,8 @@ case "$CMD" in
     fm_tunnel_launchagent_stop "$PROJECT"
     PLIST=$(fm_tunnel_plist_path "$PROJECT")
     if fm_tunnel_launchagent_loaded "$PROJECT"; then
-      # The plist and wrapper are kept, because removing them would leave a
-      # registered job with no way for a later `down` to unload it by path.
+      # The plist and wrapper are kept so a later `down` retry can unload the
+      # job by path and the operator can inspect exactly what is still loaded.
       CONNECTOR_STOPPED=0
       SURVIVORS+=("connector $(fm_tunnel_label "$PROJECT") (still loaded; LaunchAgent could not be unloaded)")
       echo "fm-tunnel: connector could NOT be stopped - LaunchAgent left in place" >&2
