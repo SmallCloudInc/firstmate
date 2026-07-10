@@ -57,7 +57,8 @@ seed_state
 python3 "$FAKE_CF" "$STATE" "$PORTFILE" & SRV_PID=$!
 for _ in $(seq 1 50); do [ -s "$PORTFILE" ] && break; sleep 0.1; done
 [ -s "$PORTFILE" ] || fail "fake Cloudflare API never came up"
-export CF_API_BASE="http://127.0.0.1:$(cat "$PORTFILE")"
+CF_API_BASE="http://127.0.0.1:$(cat "$PORTFILE")"
+export CF_API_BASE
 
 jqp() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(eval(sys.argv[2],{"d":d}))' "$STATE" "$1"; }
 set_fail() { python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d["fail"]=sys.argv[2:]; json.dump(d,open(sys.argv[1],"w"))' "$STATE" "$@"; }
