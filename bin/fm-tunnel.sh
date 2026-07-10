@@ -199,10 +199,16 @@ case "$CMD" in
     if [ -n "$TUNNEL_ID" ]; then
       echo "fm-tunnel: [1/6] tunnel '$TUNNEL_NAME' already exists ($TUNNEL_ID)" >&2
     else
-      TUNNEL_ID=$(cf_tunnel_create "$TUNNEL_NAME") || { echo "fm-tunnel: aborting; nothing else was touched" >&2; exit 1; }
+      TUNNEL_ID=$(cf_tunnel_create "$TUNNEL_NAME") || {
+        echo "fm-tunnel: aborting after step 1/6 (a tunnel named '$TUNNEL_NAME' may have been created; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        exit 1
+      }
       echo "fm-tunnel: [1/6] created tunnel '$TUNNEL_NAME' ($TUNNEL_ID)" >&2
     fi
-    [ -n "$TUNNEL_ID" ] || { echo "fm-tunnel: Cloudflare did not return a tunnel id" >&2; exit 1; }
+    [ -n "$TUNNEL_ID" ] || {
+      echo "fm-tunnel: Cloudflare did not return a tunnel id - a tunnel named '$TUNNEL_NAME' may exist; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      exit 1
+    }
 
     if ! cf_tunnel_set_ingress "$TUNNEL_ID" "$HOSTNAME" "$SERVICE"; then
       echo "fm-tunnel: aborting after step 1/6 (tunnel '$TUNNEL_NAME' / $TUNNEL_ID exists; ingress NOT set)" >&2
@@ -228,7 +234,7 @@ case "$CMD" in
         echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record left untouched)" >&2
         exit 1
       fi
-      if [ "$CURRENT_CONTENT" = "$DNS_CONTENT" ] && [ "$CURRENT_COMMENT" = "$DNS_COMMENT" ]; then
+      if [ "$CURRENT_CONTENT" = "$DNS_CONTENT" ]; then
         echo "fm-tunnel: [3/6] DNS CNAME already up to date ($HOSTNAME -> $DNS_CONTENT)" >&2
       else
         cf_dns_update "$ZONE_ID" "$DNS_ID" "$HOSTNAME" "$DNS_CONTENT" "$DNS_COMMENT" || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS update failed)" >&2; exit 1; }
@@ -252,20 +258,32 @@ case "$CMD" in
       cf_access_app_update "$APP_ID" "$HOSTNAME" "$APP_NAME" || { echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access app update failed)" >&2; exit 1; }
       echo "fm-tunnel: [4/6] Access app already exists ($APP_ID), updated" >&2
     else
-      APP_ID=$(cf_access_app_create "$HOSTNAME" "$APP_NAME") || { echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; Access app create failed)" >&2; exit 1; }
+      APP_ID=$(cf_access_app_create "$HOSTNAME" "$APP_NAME") || {
+        echo "fm-tunnel: aborting after step 3/6 (tunnel+ingress+DNS done; an Access app named '$APP_NAME' may have been created; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        exit 1
+      }
       echo "fm-tunnel: [4/6] created Access app ($APP_ID)" >&2
     fi
-    [ -n "$APP_ID" ] || { echo "fm-tunnel: Cloudflare did not return an Access app id" >&2; exit 1; }
+    [ -n "$APP_ID" ] || {
+      echo "fm-tunnel: Cloudflare did not return an Access app id - an Access app named '$APP_NAME' may exist; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      exit 1
+    }
 
     POLICY_ID=$(cf_access_policy_find "$APP_ID") || { echo "fm-tunnel: aborting after step 4/6 (tunnel+ingress+DNS+Access app done; policy NOT done)" >&2; exit 1; }
     if [ -n "$POLICY_ID" ]; then
       cf_access_policy_update "$APP_ID" "$POLICY_ID" "${TRIMMED_EMAILS[@]}" || { echo "fm-tunnel: aborting after step 4/6 (Access app done; policy update failed)" >&2; exit 1; }
       echo "fm-tunnel: [5/6] Access policy already exists, updated to allow: ${TRIMMED_EMAILS[*]}" >&2
     else
-      POLICY_ID=$(cf_access_policy_create "$APP_ID" "${TRIMMED_EMAILS[@]}") || { echo "fm-tunnel: aborting after step 4/6 (Access app done; policy create failed)" >&2; exit 1; }
+      POLICY_ID=$(cf_access_policy_create "$APP_ID" "${TRIMMED_EMAILS[@]}") || {
+        echo "fm-tunnel: aborting after step 4/6 (Access app done; an Access policy may have been created on app $APP_ID; run 'fm-tunnel.sh down $PROJECT' to clean up)" >&2
+        exit 1
+      }
       echo "fm-tunnel: [5/6] created Access policy allowing: ${TRIMMED_EMAILS[*]}" >&2
     fi
-    [ -n "$POLICY_ID" ] || { echo "fm-tunnel: Cloudflare did not return an Access policy id" >&2; exit 1; }
+    [ -n "$POLICY_ID" ] || {
+      echo "fm-tunnel: Cloudflare did not return an Access policy id - a policy may exist on app $APP_ID; run 'fm-tunnel.sh down $PROJECT' to clean up" >&2
+      exit 1
+    }
 
     RUN_TOKEN=$(cf_tunnel_token "$TUNNEL_ID") || { echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector NOT started)" >&2; exit 1; }
     if [ -z "$RUN_TOKEN" ]; then

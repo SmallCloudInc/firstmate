@@ -505,8 +505,9 @@ fm_tunnel_ensure_cloudflared() {
 
 # fm_tunnel_write_wrapper <project>: write the small script the LaunchAgent
 # execs. Keeping the token out of the plist means it never lands in a
-# world-readable file under ~/Library/LaunchAgents (still visible in `ps` while
-# cloudflared runs, which is unavoidable with the token-run model). cloudflared
+# world-readable file under ~/Library/LaunchAgents, and passing it through
+# TUNNEL_TOKEN rather than --token keeps it out of cloudflared's argv, which any
+# local user can read via `ps`. cloudflared
 # is resolved to an absolute path here, because launchd hands the job a minimal
 # PATH that contains neither Homebrew prefix - a bare name would exec-fail into
 # a silent KeepAlive respawn loop while `up` reported success.
@@ -526,7 +527,7 @@ fm_tunnel_write_wrapper() {
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec "$cloudflared_bin" tunnel run --token "\$(cat "$token_file")"
+exec env TUNNEL_TOKEN="\$(cat "$token_file")" "$cloudflared_bin" tunnel run
 EOF
   chmod 700 "$wrapper"
 }
