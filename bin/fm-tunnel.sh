@@ -436,8 +436,10 @@ case "$CMD" in
             else
               CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
               if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
+                # A foreign record routes nothing to this tunnel, so it is not a
+                # teardown failure and must not force a permanent non-zero exit.
                 OUR_ROUTE_MAY_BE_LIVE=0
-                SURVIVORS+=("DNS record $DNS_ID for '$HOSTNAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
+                echo "fm-tunnel: DNS record $DNS_ID for '$HOSTNAME' is not managed by fm-tunnel for '$PROJECT' - left untouched" >&2
               elif cf_dns_delete "$ZONE_ID" "$DNS_ID"; then
                 OUR_ROUTE_MAY_BE_LIVE=0
               else
@@ -457,7 +459,7 @@ case "$CMD" in
       fi
 
       if [ "$OUR_ROUTE_MAY_BE_LIVE" -eq 1 ]; then
-        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above could not be confirmed gone, and its login gate is not removed until it is; the tunnel itself is deleted below, so nothing behind that gate is reachable meanwhile)")
+        SURVIVORS+=("Access app for '$HOSTNAME' (left in place on purpose: the DNS record above could not be confirmed gone, and its login gate is not removed until it is)")
       elif APP_ID=$(cf_access_app_find "$HOSTNAME"); then
         if [ -n "$APP_ID" ]; then
           if ! CURRENT_APP_NAME=$(cf_access_app_current_name "$APP_ID"); then

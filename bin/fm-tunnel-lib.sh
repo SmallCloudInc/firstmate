@@ -411,8 +411,21 @@ for a in (d.get("result") or []):
       printf '%s\n' "$found"
       return 0
     fi
-    total=$(cf_extract '(d.get("result_info") or {}).get("total_pages") or 0')
-    [ -n "$total" ] && [ "$total" -gt "$page" ] 2>/dev/null || return 0
+    if ! total=$(cf_extract '(d.get("result_info") or {}).get("total_pages")'); then
+      echo "fm-tunnel: list Access apps for '$hostname' failed: pagination info unreadable" >&2
+      return 1
+    fi
+    # An absent total_pages means Cloudflare returned an unpaginated list, so
+    # this page is the whole answer. A present but non-numeric one is an
+    # unparseable read, and an unconfirmed read must never pass for "no app".
+    [ -z "$total" ] && return 0
+    case $total in
+      *[!0-9]*)
+        echo "fm-tunnel: list Access apps for '$hostname' failed: unparseable total_pages '$total'" >&2
+        return 1
+        ;;
+    esac
+    [ "$total" -gt "$page" ] || return 0
     page=$((page + 1))
   done
 }
