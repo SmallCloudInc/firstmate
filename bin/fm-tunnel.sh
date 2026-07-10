@@ -219,9 +219,10 @@ case "$CMD" in
     DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
     DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS/Access NOT done)" >&2; exit 1; }
     if [ -n "$DNS_ID" ]; then
-      CURRENT_CONTENT=$(cf_dns_current_content "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record found but unreadable)" >&2; exit 1; }
-      CURRENT_COMMENT=$(cf_dns_current_comment "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record found but unreadable)" >&2; exit 1; }
-      if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ] && [ "$CURRENT_CONTENT" != "$DNS_CONTENT" ]; then
+      CURRENT_RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record found but unreadable)" >&2; exit 1; }
+      CURRENT_CONTENT=${CURRENT_RECORD%%$'\t'*}
+      CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
+      if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
         echo "fm-tunnel: refusing to touch the existing CNAME at '$HOSTNAME' -> $CURRENT_CONTENT" >&2
         echo "fm-tunnel: it is not managed by fm-tunnel for project '$PROJECT' (expected comment: $DNS_COMMENT)" >&2
         echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record left untouched)" >&2
@@ -285,6 +286,16 @@ case "$CMD" in
       echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector failed to start - retry with: fm-tunnel.sh up $PROJECT)" >&2
       exit 1
     fi
+    CONNECTOR_UP=0
+    for _ in 1 2 3 4; do
+      if fm_tunnel_launchagent_alive "$PROJECT"; then CONNECTOR_UP=1; break; fi
+      sleep 0.5
+    done
+    if [ "$CONNECTOR_UP" -eq 0 ]; then
+      echo "fm-tunnel: connector did not stay up - see $(fm_tunnel_log_path "$PROJECT" err)" >&2
+      echo "fm-tunnel: aborting after step 5/6 (Cloudflare side fully provisioned; connector not running)" >&2
+      exit 1
+    fi
     echo "fm-tunnel: [6/6] connector LaunchAgent installed and started ($(fm_tunnel_label "$PROJECT"))" >&2
 
     echo ""
@@ -307,11 +318,11 @@ case "$CMD" in
 
     fm_tunnel_launchagent_stop "$PROJECT"
     PLIST=$(fm_tunnel_plist_path "$PROJECT")
-    if fm_tunnel_launchagent_alive "$PROJECT"; then
-      # The plist and wrapper are kept, because removing them would leave a live
-      # cloudflared with no way for a later `down` to unload it by path.
+    if fm_tunnel_launchagent_loaded "$PROJECT"; then
+      # The plist and wrapper are kept, because removing them would leave a
+      # registered job with no way for a later `down` to unload it by path.
       CONNECTOR_STOPPED=0
-      SURVIVORS+=("connector $(fm_tunnel_label "$PROJECT") (still running; LaunchAgent could not be unloaded)")
+      SURVIVORS+=("connector $(fm_tunnel_label "$PROJECT") (still loaded; LaunchAgent could not be unloaded)")
       echo "fm-tunnel: connector could NOT be stopped - LaunchAgent left in place" >&2
     else
       rm -f "$PLIST"
@@ -357,12 +368,15 @@ case "$CMD" in
             SURVIVORS+=("DNS record for '$HOSTNAME' (zone '$ZONE' not found)")
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -n "$DNS_ID" ]; then
-              if ! CURRENT_COMMENT=$(cf_dns_current_comment "$ZONE_ID" "$DNS_ID"); then
+              if ! CURRENT_RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID"); then
                 SURVIVORS+=("DNS record $DNS_ID (read failed; left untouched)")
-              elif [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
-                SURVIVORS+=("DNS record $DNS_ID for '$HOSTNAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
               else
-                cf_dns_delete "$ZONE_ID" "$DNS_ID" || SURVIVORS+=("DNS record $DNS_ID (delete failed)")
+                CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
+                if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
+                  SURVIVORS+=("DNS record $DNS_ID for '$HOSTNAME' (not managed by fm-tunnel for '$PROJECT'; left untouched)")
+                else
+                  cf_dns_delete "$ZONE_ID" "$DNS_ID" || SURVIVORS+=("DNS record $DNS_ID (delete failed)")
+                fi
               fi
             fi
           else
@@ -428,8 +442,8 @@ case "$CMD" in
             echo "dns:         zone '$ZONE' not found"
           elif DNS_ID=$(cf_dns_find "$ZONE_ID" "$HOSTNAME"); then
             if [ -n "$DNS_ID" ]; then
-              if CONTENT=$(cf_dns_current_content "$ZONE_ID" "$DNS_ID"); then
-                echo "dns:         $HOSTNAME -> $CONTENT"
+              if RECORD=$(cf_dns_current_record "$ZONE_ID" "$DNS_ID"); then
+                echo "dns:         $HOSTNAME -> ${RECORD%%$'\t'*}"
               else
                 LOOKUP_FAILED=1
                 echo "dns:         $HOSTNAME -> read failed (see error above)"

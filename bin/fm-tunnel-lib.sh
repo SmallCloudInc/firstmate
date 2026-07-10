@@ -333,22 +333,14 @@ cf_dns_find() {
   cf_extract '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
 }
 
-# cf_dns_current_content <zone_id> <record_id>: print the record's current
-# content (target), used to decide whether an update is actually needed.
-cf_dns_current_content() {
+# cf_dns_current_record <zone_id> <record_id>: print the record's current
+# content (target) and comment (the ownership marker), tab-separated, from one
+# GET. The comment is empty when the record has none.
+cf_dns_current_record() {
   local zone_id=$1 record_id=$2
   cf_request GET "/zones/$zone_id/dns_records/$record_id" || return 2
   cf_check_ok "read DNS record $record_id" || return 1
-  cf_extract 'd.get("result",{}).get("content","")'
-}
-
-# cf_dns_current_comment <zone_id> <record_id>: print the record's comment (the
-# ownership marker), or nothing when it has none.
-cf_dns_current_comment() {
-  local zone_id=$1 record_id=$2
-  cf_request GET "/zones/$zone_id/dns_records/$record_id" || return 2
-  cf_check_ok "read DNS record $record_id" || return 1
-  cf_extract 'd.get("result",{}).get("comment") or ""'
+  cf_extract 'd.get("result",{}).get("content","") + "\t" + (d.get("result",{}).get("comment") or "")'
 }
 
 # cf_dns_create <zone_id> <hostname> <content> <comment>: create the proxied CNAME.
@@ -591,6 +583,17 @@ fm_tunnel_launchagent_stop() {
   command -v launchctl >/dev/null 2>&1 || return 0
   [ -f "$plist" ] || return 0
   launchctl unload "$plist" >/dev/null 2>&1 || true
+}
+
+# fm_tunnel_launchagent_loaded <project>: succeed when launchctl still knows the
+# label at all, whatever its pid column says. This is the unload check: a
+# crashed-but-registered job (pid "-") is still loaded and must not be treated
+# as stopped.
+fm_tunnel_launchagent_loaded() {
+  local project=$1 label
+  label=$(fm_tunnel_label "$project")
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl list 2>/dev/null | awk -v l="$label" '$3 == l { found = 1 } END { exit found ? 0 : 1 }'
 }
 
 # fm_tunnel_launchagent_alive <project>: succeed only when launchctl reports a
