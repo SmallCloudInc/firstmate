@@ -325,11 +325,14 @@ cf_zone_id() {
   cf_extract '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
 }
 
-# cf_dns_find <zone_id> <hostname>: print the CNAME record id, or nothing.
+# cf_dns_find <zone_id> <hostname>: print the id of any record at the hostname,
+# whatever its type, or nothing. Type-agnostic on purpose: callers use this to
+# decide whether the hostname is theirs to claim, and an A/AAAA record there
+# holds it just as firmly as a CNAME does.
 cf_dns_find() {
   local zone_id=$1 hostname=$2 enc
   enc=$(cf_urlencode "$hostname")
-  cf_request GET "/zones/$zone_id/dns_records?type=CNAME&name=$enc" || return 2
+  cf_request GET "/zones/$zone_id/dns_records?name=$enc" || return 2
   cf_check_ok "look up DNS record for '$hostname'" || return 1
   cf_extract '(d.get("result") or [{}])[0].get("id","") if d.get("result") else ""'
 }

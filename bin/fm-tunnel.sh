@@ -54,9 +54,10 @@
 # live - a record read failure, a zone or record lookup failure, or a failed
 # delete - the Access app and its policy are deliberately left alive and
 # reported as survivors rather than deleted out from under a still-resolvable
-# hostname. A record that is not fm-tunnel's, or a zone that does not exist,
-# routes nothing to this tunnel, so fm-tunnel's own Access app is still removed
-# in those cases (the foreign record is reported untouched). It removes the
+# hostname. A record that is not fm-tunnel's, a zone that does not exist, or no
+# configured zone at all (`up` cannot create a record without one) routes nothing
+# to this tunnel, so fm-tunnel's own Access app is still removed in those cases
+# (the foreign or unverifiable record is reported untouched). It removes the
 # local token file too. Safe to run on a partially-provisioned or already-torn-
 # down project. It exits non-zero, with a summary of what survived, if any
 # lookup or delete failed - so a bad API token never reads as a successful
@@ -245,8 +246,10 @@ case "$CMD" in
     echo "fm-tunnel: [2/6] ingress set: $HOSTNAME -> $SERVICE" >&2
 
     # Claim the hostname before creating anything against it. These lookups are
-    # read-only, so an unrelated CNAME already sitting at the hostname aborts
-    # here - before an Access app would have put a login gate in front of it.
+    # read-only and type-agnostic, so any unrelated record already sitting at the
+    # hostname aborts here - before an Access app would have put a login gate in
+    # front of it. Cloudflare Access gates a domain whatever its record type, so
+    # checking only for a CNAME would leave a live A record unguarded.
     DNS_CONTENT="$TUNNEL_ID.cfargotunnel.com"
     DNS_COMMENT=$(fm_tunnel_dns_comment "$PROJECT")
     ZONE_ID=$(cf_zone_id "$ZONE") || { echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; Access+DNS NOT done, nothing touched at '$HOSTNAME')" >&2; exit 1; }
@@ -260,7 +263,7 @@ case "$CMD" in
       CURRENT_CONTENT=${CURRENT_RECORD%%$'\t'*}
       CURRENT_COMMENT=${CURRENT_RECORD#*$'\t'}
       if [ "$CURRENT_COMMENT" != "$DNS_COMMENT" ]; then
-        echo "fm-tunnel: refusing to touch the existing CNAME at '$HOSTNAME' -> $CURRENT_CONTENT" >&2
+        echo "fm-tunnel: refusing to touch the existing DNS record at '$HOSTNAME' -> $CURRENT_CONTENT" >&2
         echo "fm-tunnel: it is not managed by fm-tunnel for project '$PROJECT' (expected comment: $DNS_COMMENT)" >&2
         echo "fm-tunnel: aborting after step 2/6 (tunnel+ingress done; DNS record and Access app left untouched)" >&2
         exit 1
@@ -433,7 +436,10 @@ case "$CMD" in
           SURVIVORS+=("DNS record for '$HOSTNAME' (zone lookup failed)")
         fi
       else
-        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in)")
+        # `up` hard-requires a zone to create a record, so without one fm-tunnel
+        # never routed this hostname and has no route to protect: the gate can go.
+        OUR_ROUTE_MAY_BE_LIVE=0
+        SURVIVORS+=("DNS record for '$HOSTNAME' (no zone configured to look it up in; state unconfirmed)")
       fi
 
       if [ "$OUR_ROUTE_MAY_BE_LIVE" -eq 1 ]; then
@@ -537,6 +543,7 @@ case "$CMD" in
           echo "dns:         zone lookup failed (see error above)"
         fi
       else
+        LOOKUP_FAILED=1
         echo "dns:         zone unknown (no --zone / FM_TUNNEL_*_ZONE configured)"
       fi
 
