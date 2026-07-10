@@ -506,7 +506,8 @@ fm_tunnel_ensure_cloudflared() {
 # fm_tunnel_write_wrapper <project>: write the small script the LaunchAgent
 # execs. Keeping the token out of the plist means it never lands in a
 # world-readable file under ~/Library/LaunchAgents, and passing it through
-# TUNNEL_TOKEN rather than --token keeps it out of cloudflared's argv, which any
+# a shell environment assignment (never `env`, whose own argv would carry the
+# value) keeps it out of every process's argv, which any
 # local user can read via `ps`. cloudflared
 # is resolved to an absolute path here, because launchd hands the job a minimal
 # PATH that contains neither Homebrew prefix - a bare name would exec-fail into
@@ -527,7 +528,7 @@ fm_tunnel_write_wrapper() {
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec env TUNNEL_TOKEN="\$(cat "$token_file")" "$cloudflared_bin" tunnel run
+TUNNEL_TOKEN="\$(cat "$token_file")" exec "$cloudflared_bin" tunnel run
 EOF
   chmod 700 "$wrapper"
 }
@@ -577,13 +578,18 @@ fm_tunnel_launchagent_start() {
 }
 
 # fm_tunnel_launchagent_stop <project>: unload if loaded; never errors on an
-# already-stopped agent.
+# already-stopped agent. When the plist file is gone but launchd still knows the
+# label, unload-by-path is impossible, so fall back to removing the job by label
+# - otherwise an orphaned job could never be stopped.
 fm_tunnel_launchagent_stop() {
-  local project=$1 plist
+  local project=$1 plist label
   plist=$(fm_tunnel_plist_path "$project")
+  label=$(fm_tunnel_label "$project")
   command -v launchctl >/dev/null 2>&1 || return 0
-  [ -f "$plist" ] || return 0
-  launchctl unload "$plist" >/dev/null 2>&1 || true
+  [ -f "$plist" ] && launchctl unload "$plist" >/dev/null 2>&1
+  fm_tunnel_launchagent_loaded "$project" || return 0
+  launchctl bootout "gui/$(id -u)/${label}" >/dev/null 2>&1 ||
+    launchctl remove "$label" >/dev/null 2>&1 || true
 }
 
 # fm_tunnel_launchagent_loaded <project>: succeed when launchctl still knows the
